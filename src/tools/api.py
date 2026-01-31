@@ -119,8 +119,11 @@ def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None,
             raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
 
         # Parse response with Pydantic model
-        price_response = PriceResponse(**response.json())
-        prices = price_response.prices
+        try:
+            price_response = PriceResponse(**response.json())
+            prices = price_response.prices
+        except Exception:
+            return []
 
     if not prices:
         return []
@@ -272,8 +275,11 @@ def get_financial_metrics(
             raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
 
         # Parse response with Pydantic model
-        metrics_response = FinancialMetricsResponse(**response.json())
-        financial_metrics = metrics_response.financial_metrics
+        try:
+            metrics_response = FinancialMetricsResponse(**response.json())
+            financial_metrics = metrics_response.financial_metrics
+        except Exception:
+            return []
 
     if not financial_metrics:
         return []
@@ -445,9 +451,14 @@ def search_line_items(
         response = _make_api_request(url, headers, method="POST", json_data=body)
         if response.status_code != 200:
             raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-        data = response.json()
-        response_model = LineItemResponse(**data)
-        search_results = response_model.search_results
+        
+        try:
+            data = response.json()
+            response_model = LineItemResponse(**data)
+            search_results = response_model.search_results
+        except Exception:
+            return []
+        
         if not search_results:
             return []
 
@@ -539,9 +550,12 @@ def get_insider_trades(
             if response.status_code != 200:
                 raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
 
-            data = response.json()
-            response_model = InsiderTradeResponse(**data)
-            insider_trades = response_model.insider_trades
+            try:
+                data = response.json()
+                response_model = InsiderTradeResponse(**data)
+                insider_trades = response_model.insider_trades
+            except Exception:
+                break  # Parsing error, exit loop
 
             if not insider_trades:
                 break
@@ -646,9 +660,12 @@ def get_company_news(
             if response.status_code != 200:
                 raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
 
-            data = response.json()
-            response_model = CompanyNewsResponse(**data)
-            company_news = response_model.news
+            try:
+                data = response.json()
+                response_model = CompanyNewsResponse(**data)
+                company_news = response_model.news
+            except Exception:
+                break  # Parsing error, exit loop
 
             if not company_news:
                 break

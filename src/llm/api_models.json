@@ -1,47 +1,27 @@
 [
   {
-    "display_name": "GPT-5",
-    "model_name": "gpt-5",
+    "display_name": "Grok 4",
+    "model_name": "grok-4-0709",
+    "provider": "xAI"
+  },
+  {
+    "display_name": "GPT-5.1",
+    "model_name": "gpt-5.1",
     "provider": "OpenAI"
   },
   {
-    "display_name": "GPT-5 mini",
-    "model_name": "gpt-5-mini",
+    "display_name": "GPT-4.1",
+    "model_name": "gpt-4.1",
     "provider": "OpenAI"
   },
   {
-    "display_name": "GPT-5 nano",
-    "model_name": "gpt-5-nano",
-    "provider": "OpenAI"
-  },
-  {
-    "display_name": "GPT-4o",
-    "model_name": "gpt-4o",
-    "provider": "OpenAI"
-  },
-  {
-    "display_name": "GPT-4.5",
-    "model_name": "gpt-4.5-preview",
-    "provider": "OpenAI"
-  },
-  {
-    "display_name": "o3",
-    "model_name": "o3",
-    "provider": "OpenAI"
-  },
-  {
-    "display_name": "o4 Mini",
-    "model_name": "o4-mini",
-    "provider": "OpenAI"
-  },
-  {
-    "display_name": "Claude Haiku 3.5",
-    "model_name": "claude-3-5-haiku-latest",
+    "display_name": "Claude Sonnet 4.5",
+    "model_name": "claude-sonnet-4-5-20250929",
     "provider": "Anthropic"
   },
   {
-    "display_name": "Claude Sonnet 4",
-    "model_name": "claude-sonnet-4-20250514",
+    "display_name": "Claude Haiku 4.5",
+    "model_name": "claude-haiku-4-5-20251001",
     "provider": "Anthropic"
   },
   {
@@ -60,24 +40,9 @@
     "provider": "DeepSeek"
   },
   {
-    "display_name": "Gemini 2.5 Flash",
-    "model_name": "gemini-2.5-flash-preview-05-20",
-    "provider": "Google"
-  },
-  {
     "display_name": "Gemini 2.5 Pro",
     "model_name": "gemini-2.5-pro-preview-06-05",
     "provider": "Google"
-  },
-  {
-    "display_name": "Llama 4 Scout (17b)",
-    "model_name": "meta-llama/llama-4-scout-17b-16e-instruct",
-    "provider": "Groq"
-  },
-  {
-    "display_name": "Llama 4 Maverick (17b)",
-    "model_name": "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "provider": "Groq"
   },
   {
     "display_name": "GLM-4.5 Air",
@@ -98,5 +63,10 @@
     "display_name": "GigaChat-2-Max",
     "model_name": "GigaChat-2-Max",
     "provider": "GigaChat"
+  },
+  {
+    "display_name": "Azure Open AI Deployment",
+    "model_name": "",
+    "provider": "Azure OpenAI"
   }
 ]
