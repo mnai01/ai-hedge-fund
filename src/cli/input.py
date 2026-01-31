@@ -8,6 +8,7 @@ from colorama import Fore, Style
 from src.utils.analysts import ANALYST_ORDER
 from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider, find_model_by_name
 from src.utils.ollama import ensure_ollama_and_model
+from src.data.providers import DATA_SOURCE_ORDER, get_data_source_info
 
 from dataclasses import dataclass
 from typing import Optional
@@ -187,6 +188,42 @@ def select_model(use_ollama: bool, model_flag: str | None = None) -> tuple[str, 
     return model_name, model_provider or ""
 
 
+def select_data_provider(data_provider_flag: str | None = None) -> str:
+    """Select data provider interactively or from flag."""
+    if data_provider_flag:
+        # Validate the flag value
+        valid_providers = [key for _, key, _ in DATA_SOURCE_ORDER]
+        if data_provider_flag in valid_providers:
+            data_source_info = get_data_source_info(data_provider_flag)
+            print(f"\nUsing specified data provider: {Fore.CYAN + Style.BRIGHT}{data_source_info.display_name}{Style.RESET_ALL}\n")
+            return data_provider_flag
+        else:
+            print(f"{Fore.RED}Data provider '{data_provider_flag}' not found. Please select a provider.{Style.RESET_ALL}")
+
+    data_provider_choice = questionary.select(
+        "Select your data provider:",
+        choices=[questionary.Choice(display, value=key) for display, key, provider in DATA_SOURCE_ORDER],
+        style=questionary.Style(
+            [
+                ("selected", "fg:cyan bold"),
+                ("pointer", "fg:cyan bold"),
+                ("highlighted", "fg:cyan"),
+                ("answer", "fg:cyan bold"),
+            ]
+        ),
+    ).ask()
+
+    if not data_provider_choice:
+        print("\n\nInterrupt received. Exiting...")
+        sys.exit(0)
+
+    data_source_info = get_data_source_info(data_provider_choice)
+    print(f"\nSelected data provider: {Fore.CYAN + Style.BRIGHT}{data_source_info.display_name}{Style.RESET_ALL}")
+    print(f"Description: {data_source_info.description}\n")
+
+    return data_provider_choice
+
+
 def resolve_dates(start_date: str | None, end_date: str | None, *, default_months_back: int | None = None) -> tuple[str, str]:
     if start_date:
         try:
@@ -208,13 +245,13 @@ def resolve_dates(start_date: str | None, end_date: str | None, *, default_month
         final_start = (end_date_obj - relativedelta(months=months)).strftime("%Y-%m-%d")
     return final_start, final_end
 
-
 @dataclass
 class CLIInputs:
     tickers: list[str]
     selected_analysts: list[str]
     model_name: str
     model_provider: str
+    data_provider: str
     start_date: str
     end_date: str
     initial_cash: float
@@ -254,6 +291,15 @@ def parse_cli_inputs(
         default=0.0,
         help="Initial margin requirement ratio for shorts (e.g., 0.5 for 50%%). Defaults to 0.0",
     )
+    
+    # Data provider flag
+    parser.add_argument(
+        "--data-provider",
+        dest="data_provider",
+        type=str,
+        required=False,
+        help="Data provider to use (e.g., yfinance, financial_datasets)",
+    )
 
     if include_reasoning_flag:
         parser.add_argument("--show-reasoning", action="store_true", help="Show reasoning from each agent")
@@ -269,6 +315,7 @@ def parse_cli_inputs(
         "analysts": getattr(args, "analysts", None),
     })
     model_name, model_provider = select_model(getattr(args, "ollama", False), getattr(args, "model", None))
+    data_provider = select_data_provider(getattr(args, "data_provider", None))
     start_date, end_date = resolve_dates(getattr(args, "start_date", None), getattr(args, "end_date", None), default_months_back=default_months_back)
 
     return CLIInputs(
@@ -276,6 +323,7 @@ def parse_cli_inputs(
         selected_analysts=selected_analysts,
         model_name=model_name,
         model_provider=model_provider,
+        data_provider=data_provider,
         start_date=start_date,
         end_date=end_date,
         initial_cash=getattr(args, "initial_cash", 100000.0),
@@ -284,5 +332,6 @@ def parse_cli_inputs(
         show_agent_graph=getattr(args, "show_agent_graph", False),
         raw_args=args,
     )
+
 
 
