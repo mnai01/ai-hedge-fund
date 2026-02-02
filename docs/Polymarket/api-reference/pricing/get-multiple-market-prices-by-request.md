@@ -1,0 +1,333 @@
+---
+source_url: https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request
+scraped_at: 2026-02-01T06:08:13.615103
+scraper: DocsScraper/1.0
+---
+
+Title: Get multiple market prices by request - Polymarket Documentation
+
+URL Source: https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request
+
+Markdown Content:
+Get multiple market prices by request - Polymarket Documentation
+===============
+
+[Skip to main content](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request#content-area)
+
+[Polymarket Documentation home page![Image 1: light logo](https://mintcdn.com/polymarket-292d1b1b/HmeJ4Y1FlVRRp8nd/images/logo-black.svg?fit=max&auto=format&n=HmeJ4Y1FlVRRp8nd&q=85&s=aff81820f1f3d577fecb3956a8a3bee1)![Image 2: dark logo](https://mintcdn.com/polymarket-292d1b1b/HmeJ4Y1FlVRRp8nd/images/logo-white.svg?fit=max&auto=format&n=HmeJ4Y1FlVRRp8nd&q=85&s=3bc6857b5dbe8b74b9a7d40975c19b2b)](https://docs.polymarket.com/)
+
+Search...
+
+⌘K Ask AI
+
+*   [Main Site](https://polymarket.com/)
+*   [Main Site](https://polymarket.com/)
+
+Search...
+
+Navigation
+
+Pricing
+
+Get multiple market prices by request
+
+[User Guide](https://docs.polymarket.com/polymarket-learn/get-started/what-is-polymarket)[For Developers](https://docs.polymarket.com/quickstart/overview)[Changelog](https://docs.polymarket.com/changelog/changelog)
+
+*   [Polymarket](https://polymarket.com/)
+*   [Discord Community](https://discord.gg/polymarket)
+*   [Twitter](https://x.com/polymarket)
+
+##### Developer Quickstart
+
+*   [Developer Quickstart](https://docs.polymarket.com/quickstart/overview)
+*   [Fetching Market Data](https://docs.polymarket.com/quickstart/fetching-data)
+*   [Placing Your First Order](https://docs.polymarket.com/quickstart/first-order)
+*   [Glossary](https://docs.polymarket.com/quickstart/reference/glossary)
+*   [API Rate Limits](https://docs.polymarket.com/quickstart/introduction/rate-limits)
+*   [Endpoints](https://docs.polymarket.com/quickstart/reference/endpoints)
+
+##### Market Makers
+
+*   [Market Maker Introduction](https://docs.polymarket.com/developers/market-makers/introduction)
+*   [Setup](https://docs.polymarket.com/developers/market-makers/setup)
+*   [Trading](https://docs.polymarket.com/developers/market-makers/trading)
+*   [Liquidity Rewards](https://docs.polymarket.com/developers/market-makers/liquidity-rewards)
+*   [Maker Rebates Program](https://docs.polymarket.com/developers/market-makers/maker-rebates-program)
+*   [Data Feeds](https://docs.polymarket.com/developers/market-makers/data-feeds)
+*   [Inventory Management](https://docs.polymarket.com/developers/market-makers/inventory)
+
+##### Polymarket Builders Program
+
+*   [Builder Program Introduction](https://docs.polymarket.com/developers/builders/builder-intro)
+*   [Builder Tiers](https://docs.polymarket.com/developers/builders/builder-tiers)
+*   [Builder Profile & Keys](https://docs.polymarket.com/developers/builders/builder-profile)
+*   [Order Attribution](https://docs.polymarket.com/developers/builders/order-attribution)
+*   [Relayer Client](https://docs.polymarket.com/developers/builders/relayer-client)
+*   [Examples](https://docs.polymarket.com/developers/builders/examples)
+
+##### Central Limit Order Book
+
+*   [CLOB Introduction](https://docs.polymarket.com/developers/CLOB/introduction)
+*   [Status](https://docs.polymarket.com/developers/CLOB/status)
+*   [Quickstart](https://docs.polymarket.com/developers/CLOB/quickstart)
+*   [Authentication](https://docs.polymarket.com/developers/CLOB/authentication)
+*   [Geographic Restrictions](https://docs.polymarket.com/developers/CLOB/geoblock)
+*   Client 
+*   REST API 
+    *   Orderbook 
+    *   Pricing 
+        *   [GET Get market price](https://docs.polymarket.com/api-reference/pricing/get-market-price)
+        *   [GET Get multiple market prices](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices)
+        *   [POST Get multiple market prices by request](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request)
+        *   [GET Get midpoint price](https://docs.polymarket.com/api-reference/pricing/get-midpoint-price)
+        *   [GET Get price history for a traded token](https://docs.polymarket.com/api-reference/pricing/get-price-history-for-a-traded-token)
+
+    *   Spreads 
+
+*   Historical Timeseries Data 
+*   Order Management 
+*   Trades 
+
+##### Websocket
+
+*   [WSS Overview](https://docs.polymarket.com/developers/CLOB/websocket/wss-overview)
+*   [WSS Quickstart](https://docs.polymarket.com/quickstart/websocket/WSS-Quickstart)
+*   [WSS Authentication](https://docs.polymarket.com/developers/CLOB/websocket/wss-auth)
+*   [User Channel](https://docs.polymarket.com/developers/CLOB/websocket/user-channel)
+*   [Market Channel](https://docs.polymarket.com/developers/CLOB/websocket/market-channel)
+*   Sports Websocket 
+
+##### Real Time Data Stream
+
+*   [RTDS Overview](https://docs.polymarket.com/developers/RTDS/RTDS-overview)
+*   [RTDS Crypto Prices](https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices)
+*   [RTDS Comments](https://docs.polymarket.com/developers/RTDS/RTDS-comments)
+
+##### Gamma Structure
+
+*   [Overview](https://docs.polymarket.com/developers/gamma-markets-api/overview)
+*   [Gamma Structure](https://docs.polymarket.com/developers/gamma-markets-api/gamma-structure)
+*   [Fetching Markets](https://docs.polymarket.com/developers/gamma-markets-api/fetch-markets-guide)
+
+##### Gamma Endpoints
+
+*   Gamma Status 
+*   Sports 
+*   Tags 
+*   Events 
+*   Markets 
+*   Series 
+*   Comments 
+*   Profiles 
+*   Search 
+
+##### Data-API
+
+*   Data API Status 
+*   Misc 
+*   Core 
+*   Builders 
+
+##### Bridge & Swap
+
+*   [Overview](https://docs.polymarket.com/developers/misc-endpoints/bridge-overview)
+*   Bridge 
+
+##### Subgraph
+
+*   [Overview](https://docs.polymarket.com/developers/subgraph/overview)
+
+##### Resolution
+
+*   [Resolution](https://docs.polymarket.com/developers/resolution/UMA)
+
+##### Conditional Token Frameworks
+
+*   [Overview](https://docs.polymarket.com/developers/CTF/overview)
+*   [Splitting USDC](https://docs.polymarket.com/developers/CTF/split)
+*   [Merging Tokens](https://docs.polymarket.com/developers/CTF/merge)
+*   [Reedeeming Tokens](https://docs.polymarket.com/developers/CTF/redeem)
+*   [Deployment and Additional Information](https://docs.polymarket.com/developers/CTF/deployment-resources)
+
+##### Proxy Wallets
+
+*   [Proxy wallet](https://docs.polymarket.com/developers/proxy-wallet)
+
+##### Negative Risk
+
+*   [Overview](https://docs.polymarket.com/developers/neg-risk/overview)
+
+Get multiple market prices by request
+
+cURL
+
+Copy
+
+Ask AI
+
+```
+curl --request POST \
+  --url https://clob.polymarket.com/prices \
+  --header 'Content-Type: application/json' \
+  --data '
+[
+  {
+    "token_id": "1234567890",
+    "side": "BUY"
+  },
+  {
+    "token_id": "0987654321",
+    "side": "SELL"
+  }
+]
+'
+```
+
+200
+
+Example
+
+Copy
+
+Ask AI
+
+```
+{
+  "1234567890": {
+    "BUY": "1800.50",
+    "SELL": "1801.00"
+  },
+  "0987654321": {
+    "BUY": "50.25",
+    "SELL": "50.30"
+  }
+}
+```
+
+Pricing
+
+Get multiple market prices by request
+=====================================
+
+Retrieves market prices for specified tokens and sides via POST request
+
+POST
+
+/
+
+prices
+
+Try it
+
+Get multiple market prices by request
+
+cURL
+
+Copy
+
+Ask AI
+
+```
+curl --request POST \
+  --url https://clob.polymarket.com/prices \
+  --header 'Content-Type: application/json' \
+  --data '
+[
+  {
+    "token_id": "1234567890",
+    "side": "BUY"
+  },
+  {
+    "token_id": "0987654321",
+    "side": "SELL"
+  }
+]
+'
+```
+
+200
+
+Example
+
+Copy
+
+Ask AI
+
+```
+{
+  "1234567890": {
+    "BUY": "1800.50",
+    "SELL": "1801.00"
+  },
+  "0987654321": {
+    "BUY": "50.25",
+    "SELL": "50.30"
+  }
+}
+```
+
+#### Body
+
+application/json
+
+Maximum array length: `500`
+
+[​](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request#body-items-token-id)
+
+token_id
+
+string
+
+required
+
+The unique identifier for the token
+
+Example:
+
+`"1234567890"`
+
+[​](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request#body-items-side)
+
+side
+
+enum<string>
+
+required
+
+The side of the market (BUY or SELL)
+
+Available options:
+
+`BUY`,
+
+`SELL`
+
+Example:
+
+`"BUY"`
+
+#### Response
+
+200
+
+application/json
+
+Successful response
+
+Map of token_id to side to price
+
+[​](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices-by-request#response-additional-properties)
+
+{key}
+
+object
+
+Show child attributes
+
+[Get multiple market prices](https://docs.polymarket.com/api-reference/pricing/get-multiple-market-prices)[Get midpoint price](https://docs.polymarket.com/api-reference/pricing/get-midpoint-price)
+
+⌘I
+
+[github](https://github.com/polymarket)
+
+[Powered by](https://www.mintlify.com/?utm_campaign=poweredBy&utm_medium=referral&utm_source=polymarket-292d1b1b)
