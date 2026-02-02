@@ -20,6 +20,7 @@ class AgentController:
         model_name: str,
         model_provider: str,
         selected_analysts: Sequence[str] | None,
+        position_context: Dict[str, Any] | None = None,  # Polymarket position context
     ) -> AgentOutput:
         # Ensure we pass a plain snapshot dict to preserve legacy expectations
         if isinstance(portfolio, Portfolio):
@@ -35,6 +36,7 @@ class AgentController:
             model_name=model_name,
             model_provider=model_provider,
             selected_analysts=list(selected_analysts) if selected_analysts is not None else None,
+            position_context=position_context or {},  # Pass Polymarket context
         )
 
         # Normalize outputs to avoid None/missing keys

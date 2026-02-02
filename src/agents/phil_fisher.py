@@ -153,7 +153,10 @@ def phil_fisher_agent(state: AgentState, agent_id: str = "phil_fisher_agent"):
             "reasoning": fisher_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=fisher_output.reasoning)
+        # Create a brief summary for display
+        signal_label = fisher_output.signal.capitalize()
+        summary = f"{signal_label}: {fisher_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Wrap results in a single message
     message = HumanMessage(content=json.dumps(fisher_analysis), name=agent_id)

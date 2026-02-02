@@ -152,7 +152,10 @@ def stanley_druckenmiller_agent(state: AgentState, agent_id: str = "stanley_druc
             "reasoning": druck_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=druck_output.reasoning)
+        # Create a brief summary for display
+        signal_label = druck_output.signal.capitalize()
+        summary = f"{signal_label}: {druck_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Wrap results in a single message
     message = HumanMessage(content=json.dumps(druck_analysis), name=agent_id)

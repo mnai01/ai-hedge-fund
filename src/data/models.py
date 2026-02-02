@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -167,6 +169,7 @@ class AgentStateData(BaseModel):
     start_date: str
     end_date: str
     ticker_analyses: dict[str, TickerAnalysis]  # ticker -> analysis mapping
+    position_context: Optional[dict[str, dict]] = None  # ticker -> context mapping for Polymarket-driven positions
 
 
 class AgentStateMetadata(BaseModel):

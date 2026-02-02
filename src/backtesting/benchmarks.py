@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 from src.tools.api import get_price_data
 
@@ -12,6 +14,15 @@ class BenchmarkCalculator:
         Return is (last_close / first_close - 1) * 100, or None if unavailable.
         """
         try:
+            # Handle single-day case by extending the date range
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            
+            if start_dt >= end_dt:
+                # Single day or invalid range - extend end by 1 day
+                end_dt = end_dt + relativedelta(days=1)
+                end_date = end_dt.strftime("%Y-%m-%d")
+            
             df = get_price_data(ticker, start_date, end_date)
             if df.empty:
                 return None

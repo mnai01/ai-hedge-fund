@@ -146,7 +146,10 @@ def peter_lynch_agent(state: AgentState, agent_id: str = "peter_lynch_agent"):
             "reasoning": lynch_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=lynch_output.reasoning)
+        # Create a brief summary for display
+        signal_label = lynch_output.signal.capitalize()
+        summary = f"{signal_label}: {lynch_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Wrap up results
     message = HumanMessage(content=json.dumps(lynch_analysis), name=agent_id)

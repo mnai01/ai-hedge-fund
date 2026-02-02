@@ -141,7 +141,10 @@ def news_sentiment_agent(state: AgentState, agent_id: str = "news_sentiment_agen
             "reasoning": reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(reasoning, indent=4))
+        # Create a brief summary for display
+        signal_label = overall_signal.capitalize()
+        summary = f"{signal_label}: {bullish_signals}↑/{bearish_signals}↓ from {total_signals} articles"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     message = HumanMessage(
         content=json.dumps(sentiment_analysis),

@@ -256,8 +256,9 @@ def print_trading_output(result: dict) -> None:
 
 def print_backtest_results(table_rows: list) -> None:
     """Print the backtest results in a nicely formatted table"""
-    # Clear the screen
-    os.system("cls" if os.name == "nt" else "clear")
+    # Note: Removed screen clearing to preserve scroll history
+    # Users can scroll up to see previous output
+    print("\n" + "=" * 60)
 
     # Split rows into ticker rows and summary rows
     ticker_rows = []
@@ -298,33 +299,36 @@ def print_backtest_results(table_rows: list) -> None:
     # Add vertical spacing
     print("\n" * 2)
 
-    # Print the table with just ticker rows
-    print(
-        tabulate(
-            ticker_rows,
-            headers=[
-                "Date",
-                "Ticker",
-                "Action",
-                "Quantity",
-                "Price",
-                "Long Shares",
-                "Short Shares",
-                "Position Value",
-            ],
-            tablefmt="grid",
-            colalign=(
-                "left",    # Date
-                "left",    # Ticker
-                "center",  # Action
-                "right",   # Quantity
-                "right",   # Price
-                "right",   # Long Shares
-                "right",   # Short Shares
-                "right",   # Position Value
-            ),
+    # Print the table with just ticker rows (only if there are any)
+    if ticker_rows:
+        print(
+            tabulate(
+                ticker_rows,
+                headers=[
+                    "Date",
+                    "Ticker",
+                    "Action",
+                    "Quantity",
+                    "Price",
+                    "Long Shares",
+                    "Short Shares",
+                    "Position Value",
+                ],
+                tablefmt="grid",
+                colalign=(
+                    "left",    # Date
+                    "left",    # Ticker
+                    "center",  # Action
+                    "right",   # Quantity
+                    "right",   # Price
+                    "right",   # Long Shares
+                    "right",   # Short Shares
+                    "right",   # Position Value
+                ),
+            )
         )
-    )
+    else:
+        print(f"{Fore.YELLOW}No trades executed during this backtest period.{Style.RESET_ALL}")
 
     # Add vertical spacing
     print("\n" * 4)

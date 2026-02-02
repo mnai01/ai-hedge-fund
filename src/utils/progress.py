@@ -32,6 +32,8 @@ class AgentProgress:
     def start(self):
         """Start the progress display."""
         if not self.started:
+            # Reset agent status to clear stale data from previous runs
+            self.reset()
             self.live.start()
             self.started = True
 
@@ -40,6 +42,17 @@ class AgentProgress:
         if self.started:
             self.live.stop()
             self.started = False
+
+    def reset(self):
+        """Reset agent status to clear stale data from previous runs.
+        
+        This clears only the CLI display state (agent_status dict),
+        not the update_handlers which may be needed for other purposes.
+        """
+        self.agent_status.clear()
+        # Reset the table to clear any existing rows
+        self.table = Table(show_header=False, box=None, padding=(0, 1))
+        self.live.update(self.table)
 
     def update_status(self, agent_name: str, ticker: Optional[str] = None, status: str = "", analysis: Optional[str] = None):
         """Update the status of an agent."""
@@ -74,7 +87,7 @@ class AgentProgress:
     def _refresh_display(self):
         """Refresh the progress display."""
         self.table.columns.clear()
-        self.table.add_column(width=100)
+        self.table.add_column(width=120)
 
         # Sort agents with Risk Management and Portfolio Management at the bottom
         def sort_key(item):
@@ -89,16 +102,28 @@ class AgentProgress:
         for agent_name, info in sorted(self.agent_status.items(), key=sort_key):
             status = info["status"]
             ticker = info["ticker"]
+            analysis = info.get("analysis", "")
+            
             # Create the status text with appropriate styling
+            # Use ASCII symbols for Windows compatibility
             if status.lower() == "done":
                 style = Style(color="green", bold=True)
-                symbol = "✓"
+                symbol = "[OK]"
+                # Add analysis summary if available
+                if analysis:
+                    # Truncate to 60 chars for display alignment
+                    truncated_analysis = analysis[:60] + "..." if len(analysis) > 60 else analysis
+                    display_status = f"Done - {truncated_analysis}"
+                else:
+                    display_status = status
             elif status.lower() == "error":
                 style = Style(color="red", bold=True)
-                symbol = "✗"
+                symbol = "[X]"
+                display_status = status
             else:
                 style = Style(color="yellow")
-                symbol = "⋯"
+                symbol = "..."
+                display_status = status
 
             agent_display = self._get_display_name(agent_name)
             status_text = Text()
@@ -107,7 +132,7 @@ class AgentProgress:
 
             if ticker:
                 status_text.append(f"[{ticker}] ", style=Style(color="cyan"))
-            status_text.append(status, style=style)
+            status_text.append(display_status, style=style)
 
             self.table.add_row(status_text)
 

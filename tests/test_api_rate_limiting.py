@@ -199,8 +199,8 @@ class TestRateLimiting:
         
         # Set environment variable for API key
         with patch.dict(os.environ, {"FINANCIAL_DATASETS_API_KEY": "test-key"}):
-            # Call get_prices
-            result = get_prices("AAPL", "2024-01-01", "2024-01-02")
+            # Call get_prices with data_provider to use the mocked API path
+            result = get_prices("AAPL", "2024-01-01", "2024-01-02", data_provider="financial_datasets")
         
         # Verify the function succeeded and returned data
         assert len(result) == 1

@@ -141,7 +141,10 @@ def charlie_munger_agent(state: AgentState, agent_id: str = "charlie_munger_agen
             "reasoning": munger_output.reasoning
         }
         
-        progress.update_status(agent_id, ticker, "Done", analysis=munger_output.reasoning)
+        # Create a brief summary for display
+        signal_label = munger_output.signal.capitalize()
+        summary = f"{signal_label}: {munger_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
     
     # Wrap results in a single message for the chain
     message = HumanMessage(

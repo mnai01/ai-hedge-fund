@@ -198,11 +198,12 @@ def risk_management_agent(state: AgentState, agent_id: str = "risk_management_ag
             },
         }
         
-        progress.update_status(
-            agent_id, 
-            ticker, 
-            f"Adj. limit: {combined_limit_pct:.1%}, Available: ${max_position_size:.0f}"
-        )
+        # Create a brief summary for display
+        ann_vol = vol_data.get("annualized_volatility", 0.25)
+        max_shares_for_ticker = int(max_position_size / current_price) if current_price > 0 else 0
+        summary = f"Max ${max_position_size:,.0f} ({max_shares_for_ticker} shares), Vol {ann_vol:.0%}"
+        
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     progress.update_status(agent_id, None, "Done")
 

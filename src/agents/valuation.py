@@ -210,7 +210,12 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             "confidence": confidence,
             "reasoning": reasoning,
         }
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(reasoning, indent=4))
+        
+        # Create a brief summary for display
+        signal_label = signal.capitalize()
+        gap_pct = f"{weighted_gap:+.0%}" if weighted_gap else ""
+        summary = f"{signal_label}: Gap {gap_pct}, DCF ${dcf_val/1e9:.1f}B vs Mkt ${market_cap/1e9:.1f}B"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # ---- Emit message (for LLM tool chain) ----
     msg = HumanMessage(content=json.dumps(valuation_analysis), name=agent_id)

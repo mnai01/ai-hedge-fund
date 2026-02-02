@@ -139,7 +139,22 @@ def technical_analyst_agent(state: AgentState, agent_id: str = "technical_analys
                 },
             },
         }
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(technical_analysis, indent=4))
+        
+        # Create a brief summary for display
+        signal_label = combined_signal["signal"].capitalize()
+        key_indicators = []
+        # Add RSI if available
+        rsi_val = mean_reversion_signals["metrics"].get("rsi_14")
+        if rsi_val:
+            rsi_status = "overbought" if rsi_val > 70 else "oversold" if rsi_val < 30 else "neutral"
+            key_indicators.append(f"RSI {rsi_status}")
+        # Add trend info
+        key_indicators.append(f"Trend {trend_signals['signal']}")
+        # Add momentum info
+        key_indicators.append(f"Mom {momentum_signals['signal']}")
+        summary = f"{signal_label}: {', '.join(key_indicators[:3])}"
+        
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Create the technical analyst message
     message = HumanMessage(

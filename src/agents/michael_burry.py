@@ -145,7 +145,10 @@ def michael_burry_agent(state: AgentState, agent_id: str = "michael_burry_agent"
             "reasoning": burry_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=burry_output.reasoning)
+        # Create a brief summary for display
+        signal_label = burry_output.signal.capitalize()
+        summary = f"{signal_label}: {burry_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # ----------------------------------------------------------------------
     # Return to the graph

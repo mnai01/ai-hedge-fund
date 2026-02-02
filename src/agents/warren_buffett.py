@@ -145,7 +145,10 @@ def warren_buffett_agent(state: AgentState, agent_id: str = "warren_buffett_agen
             "reasoning": buffett_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=buffett_output.reasoning)
+        # Create a brief summary for display
+        signal_label = buffett_output.signal.capitalize()
+        summary = f"{signal_label}: {buffett_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Create the message
     message = HumanMessage(content=json.dumps(buffett_analysis), name=agent_id)

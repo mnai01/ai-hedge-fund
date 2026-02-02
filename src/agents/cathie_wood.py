@@ -98,7 +98,10 @@ def cathie_wood_agent(state: AgentState, agent_id: str = "cathie_wood_agent"):
 
         cw_analysis[ticker] = {"signal": cw_output.signal, "confidence": cw_output.confidence, "reasoning": cw_output.reasoning}
 
-        progress.update_status(agent_id, ticker, "Done", analysis=cw_output.reasoning)
+        # Create a brief summary for display
+        signal_label = cw_output.signal.capitalize()
+        summary = f"{signal_label}: {cw_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     message = HumanMessage(content=json.dumps(cw_analysis), name=agent_id)
 

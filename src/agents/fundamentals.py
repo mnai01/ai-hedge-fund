@@ -144,7 +144,18 @@ def fundamentals_analyst_agent(state: AgentState, agent_id: str = "fundamentals_
             "reasoning": reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(reasoning, indent=4))
+        # Create a brief summary for display
+        signal_label = overall_signal.capitalize()
+        key_metrics = []
+        if pe_ratio:
+            key_metrics.append(f"P/E {pe_ratio:.1f}")
+        if revenue_growth:
+            key_metrics.append(f"Rev Growth {revenue_growth:.0%}")
+        if return_on_equity:
+            key_metrics.append(f"ROE {return_on_equity:.0%}")
+        summary = f"{signal_label}: {', '.join(key_metrics[:3])}" if key_metrics else f"{signal_label}"
+
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Create the fundamental analysis message
     message = HumanMessage(

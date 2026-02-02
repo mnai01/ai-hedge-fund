@@ -49,9 +49,19 @@ class LLMModel(BaseModel):
         return self.model_name == "-"
 
     def has_json_mode(self) -> bool:
-        """Check if the model supports JSON mode"""
-        if self.is_deepseek() or self.is_gemini():
+        """Check if the model supports native JSON/structured output mode.
+        
+        Models with native JSON mode use with_structured_output() for guaranteed
+        parseable responses. Models without it use prompt-based JSON instructions
+        which allows for better chain-of-thought reasoning.
+        """
+        # DeepSeek doesn't reliably support structured output
+        if self.is_deepseek():
             return False
+        # Gemini now supports structured output via response_json_schema
+        # See: https://ai.google.dev/gemini-api/docs/structured-output
+        if self.is_gemini():
+            return True
         # Only certain Ollama models support JSON mode
         if self.is_ollama():
             return "llama3" in self.model_name or "neural-chat" in self.model_name

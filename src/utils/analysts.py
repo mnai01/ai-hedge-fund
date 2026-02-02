@@ -19,6 +19,7 @@ from src.agents.rakesh_jhunjhunwala import rakesh_jhunjhunwala_agent
 from src.agents.mohnish_pabrai import mohnish_pabrai_agent
 from src.agents.news_sentiment import news_sentiment_agent
 from src.agents.growth_agent import growth_analyst_agent
+from src.agents.polymarket_analyst import polymarket_analyst_agent
 
 # Define analyst configuration - single source of truth
 ANALYST_CONFIG = {
@@ -165,6 +166,14 @@ ANALYST_CONFIG = {
         "agent_func": valuation_analyst_agent,
         "type": "analyst",
         "order": 16,
+    },
+    "polymarket_analyst": {
+        "display_name": "Polymarket Analyst",
+        "description": "Prediction Market Specialist",
+        "investing_style": "Analyzes Polymarket prediction market events to identify stocks affected by geopolitical, economic, and political events. Uses crowd wisdom from prediction markets to generate trading signals.",
+        "agent_func": polymarket_analyst_agent,
+        "type": "analyst",
+        "order": 17,
     },
 }
 

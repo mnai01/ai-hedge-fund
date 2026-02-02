@@ -1,8 +1,9 @@
 """Helper functions for LLM"""
 
 import json
+from typing import Dict, get_origin, get_args
 from pydantic import BaseModel
-from src.llm.models import get_model, get_model_info
+from src.llm.models import get_model, get_model_info, ModelProvider
 from src.utils.progress import progress
 from src.graph.state import AgentState
 
@@ -45,11 +46,24 @@ def call_llm(
         if request and hasattr(request, 'api_keys'):
             api_keys = request.api_keys
 
-    model_info = get_model_info(model_name, model_provider)
-    llm = get_model(model_name, model_provider, api_keys)
+    # Convert model_provider string to ModelProvider enum if needed
+    provider_enum = _string_to_model_provider(model_provider)
+    
+    model_info = get_model_info(model_name, provider_enum)
+    llm = get_model(model_name, provider_enum, api_keys)
 
     # For models that support JSON mode, use structured output
-    if model_info and model_info.has_json_mode():
+    # BUT: Gemini has issues with Dict[str, X] schemas - the properties are empty
+    # which causes: "response_schema.properties["decisions"].properties: should be non-empty for OBJECT type"
+    # So we disable structured output for Gemini when the model has Dict fields
+    use_structured_output = model_info and model_info.has_json_mode()
+    
+    if use_structured_output and model_info.is_gemini():
+        # Check if the pydantic model has any Dict fields that would cause Gemini schema errors
+        if _has_dict_fields(pydantic_model):
+            use_structured_output = False
+    
+    if use_structured_output:
         llm = llm.with_structured_output(
             pydantic_model,
             method="json_mode",
@@ -99,6 +113,78 @@ def call_llm(
     return create_default_response(pydantic_model)
 
 
+def _string_to_model_provider(provider: str | ModelProvider) -> ModelProvider:
+    """Convert a string provider name to ModelProvider enum.
+    
+    Handles various formats:
+    - Already a ModelProvider enum: returns as-is
+    - Lowercase: "openai" -> ModelProvider.OPENAI
+    - Uppercase: "OPENAI" -> ModelProvider.OPENAI
+    - Title case: "OpenAI" -> ModelProvider.OPENAI
+    """
+    if isinstance(provider, ModelProvider):
+        return provider
+    
+    # Normalize the string for comparison
+    provider_upper = provider.upper().replace(" ", "_")
+    
+    # Map common variations to enum values
+    provider_map = {
+        "OPENAI": ModelProvider.OPENAI,
+        "ANTHROPIC": ModelProvider.ANTHROPIC,
+        "GOOGLE": ModelProvider.GOOGLE,
+        "GROQ": ModelProvider.GROQ,
+        "DEEPSEEK": ModelProvider.DEEPSEEK,
+        "OLLAMA": ModelProvider.OLLAMA,
+        "OPENROUTER": ModelProvider.OPENROUTER,
+        "XAI": ModelProvider.XAI,
+        "GIGACHAT": ModelProvider.GIGACHAT,
+        "AZURE_OPENAI": ModelProvider.AZURE_OPENAI,
+        "AZUREOPENAI": ModelProvider.AZURE_OPENAI,
+        "META": ModelProvider.META,
+        "ALIBABA": ModelProvider.ALIBABA,
+        "MISTRAL": ModelProvider.MISTRAL,
+    }
+    
+    if provider_upper in provider_map:
+        return provider_map[provider_upper]
+    
+    # Try to match by enum value (e.g., "OpenAI" matches ModelProvider.OPENAI.value)
+    for enum_member in ModelProvider:
+        if enum_member.value.upper() == provider_upper:
+            return enum_member
+    
+    # Default to OpenAI if no match found
+    print(f"Warning: Unknown model provider '{provider}', defaulting to OpenAI")
+    return ModelProvider.OPENAI
+
+
+def _has_dict_fields(model_class: type[BaseModel]) -> bool:
+    """Check if a Pydantic model has any Dict fields.
+    
+    Gemini's structured output has issues with Dict[str, X] schemas where
+    the properties are empty, causing validation errors. This function
+    detects such fields so we can fall back to manual JSON parsing.
+    
+    Args:
+        model_class: The Pydantic model class to check
+        
+    Returns:
+        True if the model has any Dict fields, False otherwise
+    """
+    for field_name, field_info in model_class.model_fields.items():
+        annotation = field_info.annotation
+        # Check if it's a Dict type
+        origin = get_origin(annotation)
+        if origin is dict or origin is Dict:
+            return True
+        # Also check if it's a nested model with Dict fields
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            if _has_dict_fields(annotation):
+                return True
+    return False
+
+
 def create_default_response(model_class: type[BaseModel]) -> BaseModel:
     """Creates a safe default response based on the model's fields."""
     default_values = {}
@@ -109,8 +195,19 @@ def create_default_response(model_class: type[BaseModel]) -> BaseModel:
             default_values[field_name] = 0.0
         elif field.annotation == int:
             default_values[field_name] = 0
-        elif hasattr(field.annotation, "__origin__") and field.annotation.__origin__ == dict:
-            default_values[field_name] = {}
+        elif hasattr(field.annotation, "__origin__"):
+            # Handle generic types like List, Dict, etc.
+            origin = field.annotation.__origin__
+            if origin == dict:
+                default_values[field_name] = {}
+            elif origin == list:
+                default_values[field_name] = []
+            else:
+                # For other generic types (like Literal), try to use the first allowed value
+                if hasattr(field.annotation, "__args__"):
+                    default_values[field_name] = field.annotation.__args__[0]
+                else:
+                    default_values[field_name] = None
         else:
             # For other types (like Literal), try to use the first allowed value
             if hasattr(field.annotation, "__args__"):

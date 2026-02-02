@@ -113,7 +113,10 @@ def mohnish_pabrai_agent(state: AgentState, agent_id: str = "mohnish_pabrai_agen
             "reasoning": pabrai_output.reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=pabrai_output.reasoning)
+        # Create a brief summary for display
+        signal_label = pabrai_output.signal.capitalize()
+        summary = f"{signal_label}: {pabrai_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     message = HumanMessage(content=json.dumps(pabrai_analysis), name=agent_id)
 

@@ -119,7 +119,22 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
             "reasoning": reasoning,
         }
 
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(reasoning, indent=4))
+        # Create a brief summary for display
+        signal_label = overall_signal.capitalize()
+        news_count = len(news_signals)
+        insider_count = len(insider_signals)
+        summary_parts = []
+        if news_count > 0:
+            news_bullish = news_signals.count("bullish")
+            news_bearish = news_signals.count("bearish")
+            summary_parts.append(f"News {news_bullish}↑/{news_bearish}↓")
+        if insider_count > 0:
+            insider_bullish = insider_signals.count("bullish")
+            insider_bearish = insider_signals.count("bearish")
+            summary_parts.append(f"Insider {insider_bullish}↑/{insider_bearish}↓")
+        summary = f"{signal_label}: {', '.join(summary_parts)}" if summary_parts else signal_label
+
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # Create the sentiment message
     message = HumanMessage(

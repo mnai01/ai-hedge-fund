@@ -115,7 +115,10 @@ def bill_ackman_agent(state: AgentState, agent_id: str = "bill_ackman_agent"):
             "reasoning": ackman_output.reasoning
         }
         
-        progress.update_status(agent_id, ticker, "Done", analysis=ackman_output.reasoning)
+        # Create a brief summary for display
+        signal_label = ackman_output.signal.capitalize()
+        summary = f"{signal_label}: {ackman_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
     
     # Wrap results in a single message for the chain
     message = HumanMessage(

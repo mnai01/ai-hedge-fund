@@ -117,7 +117,13 @@ def growth_analyst_agent(state: AgentState, agent_id: str = "growth_analyst_agen
             "confidence": confidence,
             "reasoning": reasoning,
         }
-        progress.update_status(agent_id, ticker, "Done", analysis=json.dumps(reasoning, indent=4))
+        
+        # Create a brief summary for display
+        signal_label = signal.capitalize()
+        rev_growth = growth_trends.get("revenue_growth", 0) or 0
+        earn_growth = growth_trends.get("earnings_growth", 0) or 0
+        summary = f"{signal_label}: Rev {rev_growth:+.0%}, Earn {earn_growth:+.0%}, Score {weighted_score:.1f}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # ---- Emit message (for LLM tool chain) ----
     msg = HumanMessage(content=json.dumps(growth_analysis), name=agent_id)

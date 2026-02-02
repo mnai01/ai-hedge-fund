@@ -149,7 +149,10 @@ def rakesh_jhunjhunwala_agent(state: AgentState, agent_id: str = "rakesh_jhunjhu
 
         jhunjhunwala_analysis[ticker] = jhunjhunwala_output.model_dump()
 
-        progress.update_status(agent_id, ticker, "Done", analysis=jhunjhunwala_output.reasoning)
+        # Create a brief summary for display
+        signal_label = jhunjhunwala_output.signal.capitalize()
+        summary = f"{signal_label}: {jhunjhunwala_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # ─── Push message back to graph state ──────────────────────────────────────
     message = HumanMessage(content=json.dumps(jhunjhunwala_analysis), name=agent_id)

@@ -127,7 +127,10 @@ def aswath_damodaran_agent(state: AgentState, agent_id: str = "aswath_damodaran_
 
         damodaran_signals[ticker] = damodaran_output.model_dump()
 
-        progress.update_status(agent_id, ticker, "Done", analysis=damodaran_output.reasoning)
+        # Create a brief summary for display
+        signal_label = damodaran_output.signal.capitalize()
+        summary = f"{signal_label}: {damodaran_output.reasoning}"
+        progress.update_status(agent_id, ticker, "Done", analysis=summary)
 
     # ─── Push message back to graph state ──────────────────────────────────────
     message = HumanMessage(content=json.dumps(damodaran_signals), name=agent_id)

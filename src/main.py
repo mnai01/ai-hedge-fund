@@ -53,6 +53,8 @@ def run_hedge_fund(
     model_name: str = "gpt-4.1",
     model_provider: str = "OpenAI",
     data_provider: str = "yfinance",
+    position_context: dict = None,  # Polymarket position context for each ticker
+    long_only: bool = False,  # Disable short selling (--no-short flag)
 ):
     # Start progress tracking
     progress.start()
@@ -75,12 +77,14 @@ def run_hedge_fund(
                     "start_date": start_date,
                     "end_date": end_date,
                     "analyst_signals": {},
+                    "position_context": position_context or {},  # Pass Polymarket context to agents
                 },
                 "metadata": {
                     "show_reasoning": show_reasoning,
                     "model_name": model_name,
                     "model_provider": model_provider,
                     "data_provider": data_provider,
+                    "long_only": long_only,  # Pass --no-short flag to portfolio manager
                 },
             },
         )
