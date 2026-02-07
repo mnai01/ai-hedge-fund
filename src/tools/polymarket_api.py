@@ -19,6 +19,8 @@ from src.data.polymarket_models import (
     PriceHistory,
     PricePoint,
     ProbabilityChange,
+    OutcomeSnapshot,
+    OutcomeLandscape,
 )
 
 
@@ -97,10 +99,13 @@ def get_active_events(
     ascending: bool = False,
     tag: Optional[str] = None,
     cache: Optional[Any] = None,
+    start_date_max: Optional[str] = None,
+    end_date_min: Optional[str] = None,
+    closed: Optional[bool] = None,
 ) -> List[PolymarketEvent]:
     """
-    Fetch active events from the Gamma API.
-    
+    Fetch events from the Gamma API.
+
     Args:
         limit: Maximum number of events to return (default: 100)
         offset: Offset for pagination
@@ -108,36 +113,57 @@ def get_active_events(
         ascending: Sort order
         tag: Filter by tag/category
         cache: Optional cache instance for storing results
-    
+        start_date_max: Only events created BEFORE this date (ISO format: YYYY-MM-DD)
+                        Useful for backtesting to get events that existed at simulation date
+        end_date_min: Only events ending AFTER this date (ISO format: YYYY-MM-DD)
+                      Useful to filter out events that already ended
+        closed: Filter by closed status. None=no filter, True=resolved events, False=active events
+                For backtesting old periods, use closed=True to get historical resolved events
+
     Returns:
         List of PolymarketEvent objects
-    
+
     Example:
-        >>> events = get_active_events(limit=10)
+        >>> events = get_active_events(limit=10)  # Active events (default)
         >>> for e in events:
         ...     print(f"{e.title}: {e.probability:.1%}")
+
+        # For backtesting April 2024 - get resolved events that existed then
+        >>> events = get_active_events(limit=50, start_date_max="2024-04-01", closed=True)
     """
-    # Build cache key
-    cache_key = f"events_{limit}_{offset}_{order}_{ascending}_{tag or 'all'}"
-    
-    # Check cache first
-    if cache:
+    # Build cache key (include date filters and closed status)
+    closed_str = str(closed) if closed is not None else 'none'
+    cache_key = f"events_{limit}_{offset}_{order}_{ascending}_{tag or 'all'}_{start_date_max or ''}_{end_date_min or ''}_{closed_str}"
+
+    # Check cache first (skip cache if using date filters for backtesting)
+    if cache and not start_date_max and not end_date_min:
         cached_data = cache.get_events(cache_key)
         if cached_data:
             return [PolymarketEvent(**e) for e in cached_data]
-    
+
     # Build request URL and params
     url = f"{GAMMA_API_BASE}/events"
     params = {
-        "closed": "false",
         "limit": limit,
         "offset": offset,
         "order": order,
         "ascending": str(ascending).lower(),
     }
-    
+
+    # Handle closed filter - default to active events if not specified
+    if closed is not None:
+        params["closed"] = str(closed).lower()
+    else:
+        params["closed"] = "false"  # Default: active events only
+
     if tag:
         params["tag"] = tag
+
+    # Date filters for backtesting
+    if start_date_max:
+        params["start_date_max"] = start_date_max
+    if end_date_min:
+        params["end_date_min"] = end_date_min
     
     response = _make_api_request(url, params=params)
     
@@ -451,6 +477,181 @@ def get_price_history_for_event(
         fidelity=fidelity,
         cache=cache,
     )
+
+
+def _extract_outcome_label(market: PolymarketMarket, event: PolymarketEvent) -> str:
+    """Extract a short outcome label from a market within a multi-outcome event.
+
+    Strategy:
+    1. Use groupItemTitle if available (e.g., "0", "4" for rate cuts)
+    2. Strip common question patterns: "Will X win...?" -> "X"
+    3. Truncate to 40 chars, fallback to question[:40]
+    """
+    import re
+
+    # The Gamma API sometimes puts a groupItemTitle on markets
+    # Try accessing it as an extra field
+    raw = market.model_extra if hasattr(market, 'model_extra') else {}
+    group_title = raw.get("groupItemTitle") if isinstance(raw, dict) else None
+    if group_title:
+        return str(group_title)[:40]
+
+    question = market.question or ""
+
+    # Strip common patterns
+    # "Will there be X rate cuts in 2024?" -> "X rate cuts in 2024"
+    patterns = [
+        r"^Will\s+(?:there\s+be\s+)?(.+?)(?:\s+in\s+\d{4})?\??$",
+        r"^Will\s+(.+?)\s+win.*\??$",
+        r"^(.+?)\s+(?:to\s+)?win.*\??$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, question, re.IGNORECASE)
+        if match:
+            label = match.group(1).strip()
+            if label:
+                return label[:40]
+
+    # Fallback: use question truncated
+    return question[:40] if question else "Unknown"
+
+
+def get_outcome_landscape(
+    event: PolymarketEvent,
+    top_n: int = 7,
+    interval: str = "max",
+    fidelity: int = 1440,
+    max_workers: int = 3,
+    cache: Optional[Any] = None,
+    analysis_date: Optional[str] = None,
+) -> Optional[OutcomeLandscape]:
+    """Build the complete probability landscape for a multi-outcome (neg-risk) event.
+
+    Returns None if the event is not multi-outcome (backward compat).
+
+    Algorithm:
+    1. Return None if not event.is_multi_outcome
+    2. Get event.top_markets_by_probability[:top_n] — sorted by YES price (not volume)
+       so the most informative outcomes get full history fetched first.
+       Volume can be high from NO bets too, but YES probability directly shows
+       which outcomes the market considers most likely.
+    3. Build OutcomeSnapshot for each market using current prices (free, from Gamma)
+    4. Use ThreadPoolExecutor to fetch price histories for top-N tokens
+    5. If analysis_date provided, look up historical prob from each history
+    6. Compute change_7d from each history
+    7. Include remaining markets beyond top_n as snapshots with current probability only
+    8. Call landscape.compute_derived() and return (now includes NO-signal tracking)
+
+    Args:
+        event: PolymarketEvent with multiple markets
+        top_n: Maximum markets to fetch full price history for
+        interval: Price history interval
+        fidelity: Price history fidelity in minutes
+        max_workers: ThreadPoolExecutor workers for concurrent fetches
+        cache: Optional cache instance
+        analysis_date: Optional date string (YYYY-MM-DD) for historical lookups
+    """
+    if not event.is_multi_outcome:
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    all_markets = event.top_markets_by_probability
+    top_markets = all_markets[:top_n]
+    remaining_markets = all_markets[top_n:]
+
+    landscape = OutcomeLandscape(
+        event_id=event.id,
+        event_title=event.title,
+        is_neg_risk=bool(event.neg_risk),
+        total_markets=len(all_markets),
+        fetched_markets=len(top_markets),
+        analysis_date=analysis_date,
+    )
+
+    # Parse analysis_date for historical lookups
+    analysis_ts: Optional[int] = None
+    if analysis_date:
+        try:
+            analysis_ts = int(datetime.strptime(analysis_date, "%Y-%m-%d").timestamp())
+        except ValueError:
+            pass
+
+    def _fetch_history_for_market(market: PolymarketMarket) -> Optional[PriceHistory]:
+        """Fetch price history for a single market's primary token."""
+        token_id = market.primary_token_id
+        if not token_id:
+            return None
+        try:
+            return get_price_history(
+                token_id=token_id,
+                interval=interval,
+                fidelity=fidelity,
+                cache=cache,
+            )
+        except Exception:
+            return None
+
+    # Fetch price histories concurrently for top-N markets
+    history_map: Dict[str, PriceHistory] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_history_for_market, m): m for m in top_markets}
+        for future in as_completed(futures):
+            market = futures[future]
+            ph = future.result()
+            if ph:
+                history_map[market.id] = ph
+
+    # Build snapshots for top markets (with full history)
+    for market in top_markets:
+        label = _extract_outcome_label(market, event)
+        prob = market.primary_probability or 0.0
+        ph = history_map.get(market.id)
+
+        # If analysis_date, look up historical prob
+        if analysis_ts and ph and ph.history:
+            closest = min(ph.history, key=lambda p: abs(p.timestamp - analysis_ts))
+            if abs(closest.timestamp - analysis_ts) <= 172800:  # 2 days
+                prob = closest.probability
+
+        # Compute 7-day change
+        change_7d = None
+        if ph and ph.history and len(ph.history) >= 2:
+            ref_ts = (analysis_ts or ph.history[-1].timestamp) - 7 * 86400
+            current_ts = analysis_ts or ph.history[-1].timestamp
+            ref_point = min(ph.history, key=lambda p: abs(p.timestamp - ref_ts))
+            cur_point = min(ph.history, key=lambda p: abs(p.timestamp - current_ts))
+            change_7d = cur_point.probability - ref_point.probability
+
+        snapshot = OutcomeSnapshot(
+            market_id=market.id,
+            question=market.question or "",
+            outcome_label=label,
+            current_probability=prob,
+            change_7d=change_7d,
+            volume=market.volume,
+            token_id=market.primary_token_id,
+            price_history=ph,
+        )
+        landscape.outcomes.append(snapshot)
+
+    # Add remaining markets as snapshots with current probability only
+    for market in remaining_markets:
+        label = _extract_outcome_label(market, event)
+        prob = market.primary_probability or 0.0
+
+        snapshot = OutcomeSnapshot(
+            market_id=market.id,
+            question=market.question or "",
+            outcome_label=label,
+            current_probability=prob,
+            volume=market.volume,
+            token_id=market.primary_token_id,
+        )
+        landscape.outcomes.append(snapshot)
+
+    landscape.compute_derived()
+    return landscape
 
 
 def detect_probability_changes(
@@ -782,23 +983,21 @@ def get_resolved_events(
         if cached_data:
             return [PolymarketEvent(**e) for e in cached_data]
     
-    # Build request URL and params using API query parameters
+    # Build request URL and params using documented API query parameters
     url = f"{GAMMA_API_BASE}/events"
     params: Dict[str, Any] = {
         "closed": "true",  # API field: get resolved events only
-        "volume_num_min": min_volume,
-        "liquidity_num_min": min_liquidity,
         "order": "volume",  # Sort by volume descending
         "ascending": "false",
         "limit": limit,
     }
-    
+
     # Add date range filters (ISO format dates)
     if start_date:
         params["end_date_min"] = start_date
     if end_date:
         params["end_date_max"] = end_date
-    
+
     response = _make_api_request(url, params=params)
     
     if response.status_code != 200:
@@ -815,6 +1014,13 @@ def get_resolved_events(
             events_data = data.get("events", data.get("data", []))
             events = [PolymarketEvent(**event_data) for event_data in events_data]
         
+        # Client-side volume/liquidity filtering (API doesn't support these filters)
+        if min_volume > 0 or min_liquidity > 0:
+            events = [
+                e for e in events
+                if (e.volume or 0) >= min_volume and (e.liquidity or 0) >= min_liquidity
+            ]
+
         # Filter by categories if specified (client-side filtering)
         if categories:
             categories_lower = [c.lower() for c in categories]
@@ -822,7 +1028,7 @@ def get_resolved_events(
                 e for e in events
                 if e.category and e.category.lower() in categories_lower
             ]
-        
+
         # Cache the results
         if cache and events:
             cache.set_events(cache_key, [e.model_dump() for e in events])
@@ -997,41 +1203,34 @@ def get_events_active_on_date(
     min_volume: float = 50000,
     min_liquidity: float = 10000,
     categories: Optional[List[str]] = None,
-    limit: int = 100,
     cache: Optional[Any] = None,
     verbose: bool = False,
+    **kwargs,
 ) -> List[PolymarketEvent]:
     """
-    Fetch events that were ACTIVE on a specific historical date.
-    
+    Fetch ALL events that were ACTIVE on a specific historical date.
+
+    Paginates through every page from the Gamma API, then applies
+    client-side date, category, and volume/liquidity filters.  Returns
+    all qualifying events — downstream scoring and probability filtering
+    determine the final picks.
+
     An event was active on a date if:
-    - creationDate <= as_of_date (event existed)
+    - startDate <= as_of_date (event existed)
     - closedTime > as_of_date OR closedTime is null (not yet resolved)
-    - endDate > as_of_date (not yet expired)
-    
-    This is used for historical backtesting to simulate what events
-    would have been available to trade on a given date.
-    
+    - endDate > as_of_date OR endDate is null (not yet expired)
+
     Args:
         as_of_date: The historical date to check (ISO format: "2024-01-01")
-        min_volume: Minimum volume in USD (default: 50000)
-        min_liquidity: Minimum liquidity (default: 10000)
+        min_volume: Minimum volume in USD (default: 50000) — client-side filter
+        min_liquidity: Minimum liquidity (default: 10000) — client-side filter
         categories: Filter by category list (client-side filtering)
-        limit: Maximum events to return (default: 100)
         cache: Optional cache instance for storing results
         verbose: Print detailed debug information (default: False)
-    
+
     Returns:
-        List of PolymarketEvent objects that were active on the specified date
-    
-    Example:
-        >>> # Get events that were active on Jan 1, 2024
-        >>> events = get_events_active_on_date(
-        ...     as_of_date="2024-01-01",
-        ...     min_volume=50000
-        ... )
-        >>> for e in events:
-        ...     print(f"{e.title}: prob={e.probability:.1%}")
+        List of PolymarketEvent objects that were active on the specified date,
+        sorted by volume descending.
     """
     # Parse the as_of_date
     try:
@@ -1045,7 +1244,7 @@ def get_events_active_on_date(
         print(f"   [DEBUG] Filters: min_volume=${min_volume:,.0f}, min_liquidity=${min_liquidity:,.0f}")
     
     # Build cache key
-    cache_key = f"events_active_on_{as_of_date}_{min_volume}_{min_liquidity}_{limit}"
+    cache_key = f"events_active_on_{as_of_date}_{min_volume}_{min_liquidity}"
     if categories:
         cache_key += f"_{'_'.join(sorted(categories))}"
     
@@ -1057,62 +1256,63 @@ def get_events_active_on_date(
                 print(f"   [DEBUG] Returning {len(cached_data)} events from cache")
             return [PolymarketEvent(**e) for e in cached_data]
     
-    # We need to fetch BOTH active and closed events to find those that were
-    # active on the target date. An event that is now closed may have been
-    # active on the historical date.
+    # Paginate events ordered by volume descending. Stop as soon as volume
+    # drops below min_volume — everything after is guaranteed to be lower.
+    #
+    # Server-side filters:
+    #   start_date_max = as_of_date  -> event's startDate <= this date
+    #   end_date_min   = as_of_date  -> event's endDate   >= this date
+    #
+    # No "closed" filter: a single query returns both still-open AND
+    # now-resolved events.  For historical dates closed=false returns 0
+    # anyway (all old events have since resolved).
     all_events: List[PolymarketEvent] = []
-    
-    # Fetch active events (still open)
+    PAGE_SIZE = 100
+    volume_cutoff = False
+
     url = f"{GAMMA_API_BASE}/events"
-    params_active: Dict[str, Any] = {
-        "closed": "false",
-        "volume_num_min": min_volume,
-        "liquidity_num_min": min_liquidity,
-        "order": "volume",
-        "ascending": "false",
-        "limit": limit * 2,  # Fetch more to filter
-    }
-    
-    response = _make_api_request(url, params=params_active)
-    active_count = 0
-    if response.status_code == 200:
+    offset = 0
+    while True:
+        params: Dict[str, Any] = {
+            "start_date_max": as_of_date,
+            "end_date_min": as_of_date,
+            "order": "volume",
+            "ascending": "false",
+            "limit": PAGE_SIZE,
+            "offset": offset,
+        }
+        response = _make_api_request(url, params=params)
+        if response.status_code != 200:
+            break
         data = response.json()
         if isinstance(data, list):
-            active_count = len(data)
-            all_events.extend([PolymarketEvent(**e) for e in data])
+            page_raw = data
         else:
-            events_data = data.get("events", data.get("data", []))
-            active_count = len(events_data)
-            all_events.extend([PolymarketEvent(**e) for e in events_data])
-    
+            page_raw = data.get("events", data.get("data", []))
+        if not page_raw:
+            break
+
+        # Early-exit: results are ordered by volume desc, so once an event
+        # drops below our threshold every subsequent event will too.
+        for raw in page_raw:
+            event = PolymarketEvent(**raw)
+            event_vol = event.volume or 0
+            if event_vol < min_volume:
+                volume_cutoff = True
+                break
+            # Also gate on liquidity while we're here (skip check if API returns null)
+            if min_liquidity > 0 and event.liquidity is not None and event.liquidity < min_liquidity:
+                continue
+            all_events.append(event)
+
+        if volume_cutoff or len(page_raw) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+
     if verbose:
-        print(f"   [DEBUG] API returned {active_count} active (open) events")
-    
-    # Fetch closed events (may have been active on target date)
-    params_closed: Dict[str, Any] = {
-        "closed": "true",
-        "volume_num_min": min_volume,
-        "liquidity_num_min": min_liquidity,
-        "order": "volume",
-        "ascending": "false",
-        "limit": limit * 2,
-    }
-    
-    response = _make_api_request(url, params=params_closed)
-    closed_count = 0
-    if response.status_code == 200:
-        data = response.json()
-        if isinstance(data, list):
-            closed_count = len(data)
-            all_events.extend([PolymarketEvent(**e) for e in data])
-        else:
-            events_data = data.get("events", data.get("data", []))
-            closed_count = len(events_data)
-            all_events.extend([PolymarketEvent(**e) for e in events_data])
-    
-    if verbose:
-        print(f"   [DEBUG] API returned {closed_count} closed events")
-        print(f"   [DEBUG] Total events from API: {len(all_events)}")
+        pages = (offset // PAGE_SIZE) + 1
+        print(f"   [DEBUG] API returned {len(all_events)} events above vol/liq threshold "
+              f"({pages} page(s), stopped={'volume cutoff' if volume_cutoff else 'end of data'})")
     
     # Filter events that were active on the target date
     active_on_date: List[PolymarketEvent] = []
@@ -1126,10 +1326,10 @@ def get_events_active_on_date(
         "passed": 0,
     }
     
-    # Sample events for debugging (first 3 that fail each filter)
-    sample_not_started: List[Dict[str, Any]] = []
-    sample_already_closed: List[Dict[str, Any]] = []
-    sample_already_ended: List[Dict[str, Any]] = []
+    # Examples of filtered events for debugging (first 3 per filter)
+    debug_not_started: List[Dict[str, Any]] = []
+    debug_already_closed: List[Dict[str, Any]] = []
+    debug_already_ended: List[Dict[str, Any]] = []
     
     for event in all_events:
         # Check if event existed on target date (startDate <= as_of_date)
@@ -1147,9 +1347,10 @@ def get_events_active_on_date(
                 if started > target_date:
                     # Event didn't exist yet on target date
                     filter_stats["filtered_not_started"] += 1
-                    if len(sample_not_started) < 3:
-                        sample_not_started.append({
+                    if len(debug_not_started) < 3:
+                        debug_not_started.append({
                             "title": event.title[:50] if event.title else "Unknown",
+                            "slug": event.slug,
                             "start_date": event_start_date,
                             "target_date": as_of_date,
                         })
@@ -1158,24 +1359,25 @@ def get_events_active_on_date(
                 # If we can't parse start date, skip this check
                 pass
         
-        # Check if event was not yet closed on target date
-        # Note: The model uses 'closed' boolean, not a timestamp. We check end_date instead.
-        # If the event is marked as closed and end_date <= target_date, it was already resolved.
-        if event.closed and event.end_date:
+        # Check if event was already resolved on target date using closedTime
+        # (actual resolution timestamp), falling back to endDate if unavailable.
+        resolved_date_str = event.closed_time or (event.end_date if event.closed else None)
+        if resolved_date_str:
             try:
-                if "T" in event.end_date:
-                    closed_dt = datetime.fromisoformat(event.end_date.replace("Z", "+00:00"))
+                if "T" in resolved_date_str:
+                    closed_dt = datetime.fromisoformat(resolved_date_str.replace("Z", "+00:00"))
                     closed_dt = closed_dt.replace(tzinfo=None)
                 else:
-                    closed_dt = datetime.strptime(event.end_date.split("T")[0], "%Y-%m-%d")
-                
+                    closed_dt = datetime.strptime(resolved_date_str.split("T")[0], "%Y-%m-%d")
+
                 if closed_dt <= target_date:
-                    # Event was already closed on target date
+                    # Event was already resolved on target date
                     filter_stats["filtered_already_closed"] += 1
-                    if len(sample_already_closed) < 3:
-                        sample_already_closed.append({
+                    if len(debug_already_closed) < 3:
+                        debug_already_closed.append({
                             "title": event.title[:50] if event.title else "Unknown",
-                            "end_date": event.end_date,
+                            "slug": event.slug,
+                            "end_date": resolved_date_str,
                             "target_date": as_of_date,
                         })
                     continue
@@ -1195,9 +1397,10 @@ def get_events_active_on_date(
                 if ended <= target_date:
                     # Event had already ended on target date
                     filter_stats["filtered_already_ended"] += 1
-                    if len(sample_already_ended) < 3:
-                        sample_already_ended.append({
+                    if len(debug_already_ended) < 3:
+                        debug_already_ended.append({
                             "title": event.title[:50] if event.title else "Unknown",
+                            "slug": event.slug,
                             "end_date": end_date,
                             "target_date": as_of_date,
                         })
@@ -1216,22 +1419,31 @@ def get_events_active_on_date(
         print(f"   [DEBUG]   Filtered (already ended): {filter_stats['filtered_already_ended']}")
         print(f"   [DEBUG]   Passed date filters: {filter_stats['passed']}")
         
-        if sample_not_started:
-            print(f"\n   [DEBUG] Sample events filtered (not started yet):")
-            for s in sample_not_started:
+        if debug_not_started:
+            print(f"\n   [DEBUG] Events filtered (not started yet):")
+            for s in debug_not_started:
+                url = f"https://polymarket.com/event/{s['slug']}" if s.get('slug') else ""
                 print(f"   [DEBUG]   - '{s['title']}' started {s['start_date']} > target {s['target_date']}")
-        
-        if sample_already_closed:
-            print(f"\n   [DEBUG] Sample events filtered (already closed):")
-            for s in sample_already_closed:
+                if url:
+                    print(f"   [DEBUG]     {url}")
+
+        if debug_already_closed:
+            print(f"\n   [DEBUG] Events filtered (already closed):")
+            for s in debug_already_closed:
+                url = f"https://polymarket.com/event/{s['slug']}" if s.get('slug') else ""
                 print(f"   [DEBUG]   - '{s['title']}' ended {s['end_date']} <= target {s['target_date']}")
-        
-        if sample_already_ended:
-            print(f"\n   [DEBUG] Sample events filtered (already ended):")
-            for s in sample_already_ended:
+                if url:
+                    print(f"   [DEBUG]     {url}")
+
+        if debug_already_ended:
+            print(f"\n   [DEBUG] Events filtered (already ended):")
+            for s in debug_already_ended:
+                url = f"https://polymarket.com/event/{s['slug']}" if s.get('slug') else ""
                 print(f"   [DEBUG]   - '{s['title']}' ended {s['end_date']} <= target {s['target_date']}")
+                if url:
+                    print(f"   [DEBUG]     {url}")
     
-    # Remove duplicates (same event might appear in both active and closed)
+    # Remove duplicates (API may return the same event at page boundaries)
     seen_ids = set()
     unique_events: List[PolymarketEvent] = []
     for event in active_on_date:
@@ -1253,17 +1465,22 @@ def get_events_active_on_date(
         if verbose:
             print(f"   [DEBUG] After category filter ({categories}): {len(unique_events)} events (was {pre_category_count})")
     
-    # Sort by volume (descending) and limit
+    # Volume/liquidity already filtered during pagination (early-exit).
+    # Sort by volume (descending) — no cap here; let the downstream scorer
+    # and discover_tickers_from_events() apply their own limits.
     unique_events.sort(key=lambda e: e.volume or 0, reverse=True)
-    result = unique_events[:limit]
-    
+    result = unique_events
+
     if verbose:
-        print(f"   [DEBUG] Final result: {len(result)} events (limit={limit})")
+        print(f"   [DEBUG] Final result: {len(result)} events (no volume cap)")
         if result:
-            print(f"\n   [DEBUG] Sample events returned:")
+            print(f"\n   [DEBUG] Top events returned (by volume):")
             for i, e in enumerate(result[:5]):
+                url = f"https://polymarket.com/event/{e.slug}" if e.slug else ""
                 print(f"   [DEBUG]   {i+1}. '{e.title[:50] if e.title else 'Unknown'}...'")
                 print(f"   [DEBUG]      start={e.start_date}, end={e.end_date}, vol=${e.volume or 0:,.0f}")
+                if url:
+                    print(f"   [DEBUG]      {url}")
     
     # Cache the results
     if cache and result:
