@@ -51,8 +51,8 @@ class TradingConfig:
     selected_analysts: List[str] = field(default_factory=list)
     autonomous_mode: bool = False
     max_positions: int = 10
-    min_probability: float = 0.60
-    max_probability: float = 0.85
+    min_probability: float = 0.25
+    max_probability: float = 0.75
     min_confidence: int = 70
     min_score: float = 40.0
     validate_with_news: bool = True
@@ -191,13 +191,20 @@ class TradingCycle:
         """
         discovered_tickers: List[str] = []
         resolved_events: Dict[str, str] = {}
-        
+
         # Make a working copy of tickers to avoid mutating the input
         working_tickers = list(tickers)
 
         try:
             # ==================== PHASE 1: DISCOVERY/UPDATE ====================
             # This phase runs EVERY cycle, not just at the start
+
+            # IMPORTANT: In backtest mode, clear event history at the start of each day
+            # so that Polymarket events are re-evaluated with fresh probability data.
+            # Without this, events analyzed on Day 1 would be skipped on Day 2+
+            # due to the skip_duplicates logic, even if probabilities have changed.
+            if mode == "backtest":
+                self.discovery_manager.clear_event_history()
 
             if self.config.autonomous_mode:
                 # 1a. Update existing position contexts
@@ -413,10 +420,10 @@ class TradingCycle:
 def is_weekend(date_str: str) -> bool:
     """
     Check if a date is a weekend.
-    
+
     Args:
         date_str: Date string in YYYY-MM-DD format
-        
+
     Returns:
         True if Saturday or Sunday
     """
@@ -426,23 +433,17 @@ def is_weekend(date_str: str) -> bool:
 
 def adjust_to_business_day(date_str: str, forward: bool = True) -> str:
     """
-    Adjust a weekend date to the nearest business day.
-    
+    Adjust a non-trading date to the nearest NYSE trading day.
+
+    Uses the NYSE trading calendar so holidays (Good Friday, MLK Day, etc.)
+    are handled in addition to weekends.
+
     Args:
         date_str: Date string in YYYY-MM-DD format
-        forward: If True, move to next business day; if False, move to previous
-        
+        forward: If True, move to next trading day; if False, move to previous
+
     Returns:
         Adjusted date string in YYYY-MM-DD format
     """
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    weekday = dt.weekday()
-    
-    if weekday == 5:  # Saturday
-        delta = timedelta(days=2 if forward else -1)
-    elif weekday == 6:  # Sunday
-        delta = timedelta(days=1 if forward else -2)
-    else:
-        delta = timedelta(days=0)
-    
-    return (dt + delta).strftime("%Y-%m-%d")
+    from src.utils.trading_calendar import adjust_to_trading_day
+    return adjust_to_trading_day(date_str, forward=forward)
