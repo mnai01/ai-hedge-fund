@@ -287,7 +287,9 @@ class BacktestService:
         # Pre-fetch all data at the start
         self.prefetch_data()
 
-        dates = pd.date_range(self.start_date, self.end_date, freq="B")
+        from src.utils.trading_calendar import get_trading_days, get_previous_trading_day
+        trading_day_strs = get_trading_days(self.start_date, self.end_date)
+        dates = [pd.Timestamp(d) for d in trading_day_strs]
         performance_metrics = {
             "sharpe_ratio": 0.0,
             "sortino_ratio": 0.0,
@@ -311,7 +313,7 @@ class BacktestService:
 
             lookback_start = (current_date - timedelta(days=30)).strftime("%Y-%m-%d")
             current_date_str = current_date.strftime("%Y-%m-%d")
-            previous_date_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            previous_date_str = get_previous_trading_day(current_date_str)
 
             if lookback_start == current_date_str:
                 continue
