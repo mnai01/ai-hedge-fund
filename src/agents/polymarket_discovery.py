@@ -44,10 +44,13 @@ _console = Console()
 from src.tools.polymarket_api import (
     get_active_events,
     get_event_by_id,
+    get_events_active_on_date,
+    get_price_history,
     get_price_history_for_event,
+    get_outcome_landscape,
 )
 from src.tools.event_scorer import EventScorer, EventScore
-from src.data.polymarket_models import PolymarketEvent, PriceHistory
+from src.data.polymarket_models import PolymarketEvent, PriceHistory, ProbabilityConviction, OutcomeLandscape
 from src.data.polymarket_cache import get_polymarket_cache, PolymarketCache
 from src.data.position_context import (
     PositionContext,
@@ -213,10 +216,15 @@ def _log_validation_summary(
 
 class StockMapping(BaseModel):
     """LLM output for mapping an event to a single affected stock."""
-    
+
     ticker: str = Field(description="US stock ticker symbol (e.g., TSLA, LMT)")
     direction: Literal["bullish", "bearish"] = Field(
-        description="Expected impact direction if the event happens"
+        description="Expected impact direction given the current probability landscape"
+    )
+    outcome_dependent: bool = Field(
+        default=False,
+        description="True if this pick depends on a specific event outcome, "
+        "False if the stock is affected regardless of outcome"
     )
     confidence: int = Field(
         ge=0, le=100,
@@ -1081,8 +1089,8 @@ def discover_tickers_from_events(
     portfolio_positions: Optional[Dict[str, PositionContext]] = None,
     event_history: Optional[EventHistory] = None,
     min_score: float = 50.0,
-    min_probability: float = 0.60,
-    max_probability: float = 0.85,
+    min_probability: float = 0.25,
+    max_probability: float = 0.75,
     min_confidence: int = 70,
     limit: int = 10,
     cache: Optional[PolymarketCache] = None,
@@ -1146,88 +1154,79 @@ def discover_tickers_from_events(
     """
     if cache is None:
         cache = get_polymarket_cache()
-    
+
     if event_history is None:
         event_history = EventHistory()
-    
+
     discovered = []
     scorer = EventScorer()
-    
-    # Get active events if not provided
-    if events is None:
-        events = get_active_events(
-            limit=limit * 5,  # Fetch more, filter down after scoring
-            order="volume",
-            ascending=False,
-            cache=cache,
-        )
-    
-    # Step 1: Score events with EventScorer
-    _console.print("")
-    _log_step("🎯", f"[bold]Polymarket Event Discovery[/bold]")
-    _log_step("📊", f"Scoring {len(events) if events else 0} events...", indent=1)
-    
-    scored_events = scorer.rank_events(
-        events,
-        min_score=min_score,
-        limit=limit * 2,  # Keep more for probability filtering
-    )
-    
-    _log_step("✅", f"Found {len(scored_events.events)} events above score threshold ({min_score})", indent=1)
-    progress.update_status("polymarket_discovery", None, f"Scored {len(scored_events.events)} events (min_score={min_score})")
-    
-    # Step 2: Filter by probability range and deduplication
-    # For backtesting, we need to get historical probability at simulation_date
+
+    # Parse simulation_date early for backtesting mode
     simulation_timestamp: Optional[int] = None
+    sim_dt: Optional[datetime] = None
     if simulation_date:
         try:
             from datetime import datetime as dt
             sim_dt = dt.strptime(simulation_date, "%Y-%m-%d")
             simulation_timestamp = int(sim_dt.timestamp())
-            _log_step("📅", f"Backtesting mode: Using probability as of {simulation_date}", indent=1)
         except ValueError:
             _log_step("⚠️", f"Invalid simulation_date format: {simulation_date}, using current probability", indent=1)
-    
-    filtered_events: List[Tuple[PolymarketEvent, EventScore, Optional[float]]] = []
+
+    # Get active events if not provided
+    if events is None:
+        if simulation_date:
+            # Backtesting: fetch events that were active on the simulation date
+            # Uses server-side date filtering (start_date_max + end_date_min)
+            # and fetches both closed and still-active events
+            _log_step("📅", f"Backtesting: Fetching events active on {simulation_date}", indent=1)
+            events = get_events_active_on_date(
+                as_of_date=simulation_date,
+                min_volume=50000,
+                min_liquidity=10000,
+                cache=cache,
+            )
+            _log_step("📊", f"Found {len(events)} events active on {simulation_date}", indent=1)
+        else:
+            # Live mode: get currently active events
+            events = get_active_events(
+                limit=limit * 5,  # Fetch more, filter down after scoring
+                order="volume",
+                ascending=False,
+                cache=cache,
+                closed=False,  # Active events only
+            )
+
+    # Step 2: Score events with EventScorer
+    _console.print("")
+    _log_step("🎯", f"[bold]Polymarket Event Discovery[/bold]")
+    _log_step("📊", f"Scoring {len(events) if events else 0} events...", indent=1)
+
+    scored_events = scorer.rank_events(
+        events,
+        min_score=min_score,
+        limit=limit * 3,  # Keep more for probability filtering after history fetch
+    )
+
+    _log_step("✅", f"Found {len(scored_events.events)} events above score threshold ({min_score})", indent=1)
+    progress.update_status("polymarket_discovery", None, f"Scored {len(scored_events.events)} events (min_score={min_score})")
+
+    if simulation_date:
+        _log_step("📅", f"Backtesting mode: Will fetch historical probability as of {simulation_date}", indent=1)
+
+    # Step 3: For each scored event, check deduplication FIRST (cheap),
+    # then fetch price history (expensive), then filter by probability
+    filtered_events: List[Tuple[PolymarketEvent, EventScore, Optional[float], Optional[PriceHistory], Optional[ProbabilityConviction]]] = []
     skipped_count = 0
     prob_filtered_count = 0
-    
+    no_history_count = 0
+
+    # Step 3a: Cheap deduplication pass — no API calls
+    candidates: List[Tuple[PolymarketEvent, EventScore]] = []
     for event_score in scored_events.events:
-        # Find the original event object
         event = _find_event_by_id(events, event_score.event_id)
         if not event:
             continue
-        
-        # Get probability - use historical if simulation_date provided
-        prob = event.probability
-        historical_prob: Optional[float] = None
-        
-        if simulation_timestamp and event.primary_market and event.primary_market.primary_token_id:
-            # Fetch historical probability at simulation date
-            try:
-                from src.tools.polymarket_api import get_price_history
-                price_history = get_price_history(
-                    token_id=event.primary_market.primary_token_id,
-                    interval="max",
-                    fidelity=1440,  # Daily data points
-                    cache=cache,
-                )
-                if price_history and price_history.history:
-                    historical_prob = price_history.get_probability_at(simulation_timestamp)
-                    if historical_prob is not None:
-                        prob = historical_prob
-                        _log_step("📊", f"Historical prob at {simulation_date}: {prob:.1%} (current: {event.probability:.1%})", indent=2)
-            except Exception as e:
-                _log_step("⚠️", f"Could not fetch historical probability: {e}", indent=2)
-        
-        # Check probability range
-        if prob is None or not (min_probability <= prob <= max_probability):
-            prob_filtered_count += 1
-            prob_str = f"{prob:.1%}" if prob is not None else "None"
-            _log_step("[SKIP]", f"Prob filter: {event.title[:40]}... (prob={prob_str}, range={min_probability:.0%}-{max_probability:.0%})", indent=1)
-            continue
-        
-        # Step 3: Deduplication check
+
         if skip_duplicates:
             should_skip, reason = event_history.should_skip_event(
                 event_id=event.id,
@@ -1237,22 +1236,116 @@ def discover_tickers_from_events(
                 progress.update_status("polymarket_discovery", None, f"Skipping: {reason}")
                 skipped_count += 1
                 continue
-        
-        # Store event, score, and historical probability (if available)
-        filtered_events.append((event, event_score, historical_prob))
-        
-        if len(filtered_events) >= limit:
-            break
-    
-    progress.update_status("polymarket_discovery", None, f"{len(filtered_events)} events after filtering, {skipped_count} skipped (duplicates)")
-    
+
+        candidates.append((event, event_score))
+
+    # Step 3b: Fetch historical probability — concurrent when backtesting
+    if simulation_timestamp:
+        import concurrent.futures
+
+        # Separate candidates that need history fetching vs those without token_id
+        needs_fetch: List[Tuple[PolymarketEvent, EventScore]] = []
+        for event, event_score in candidates:
+            if event.primary_market and event.primary_market.primary_token_id:
+                needs_fetch.append((event, event_score))
+            else:
+                title = (event.title or "Unknown")[:50]
+                _log_step("⏭️", f"Skipped (no token_id): '{title}'", indent=2)
+                no_history_count += 1
+
+        def _fetch_one(item: Tuple[PolymarketEvent, EventScore]) -> Optional[Tuple[PolymarketEvent, EventScore, Optional[float], PriceHistory, Optional[ProbabilityConviction]]]:
+            """Fetch historical prob for a single event. Returns None on skip."""
+            from src.data.event_portfolio import compute_probability_conviction
+            ev, es = item
+            title = (ev.title or "Unknown")[:50]
+            try:
+                ph = get_price_history(
+                    token_id=ev.primary_market.primary_token_id,
+                    interval="max",
+                    fidelity=1440,
+                    cache=cache,
+                )
+                if not ph or not ph.history:
+                    _log_step("⏭️", f"Skipped (no history): '{title}'", indent=2)
+                    return None
+
+                earliest_ts = min(p.timestamp for p in ph.history)
+                if earliest_ts > simulation_timestamp:
+                    _log_step("⏭️", f"Skipped (history too recent): '{title}'", indent=2)
+                    return None
+
+                closest = min(ph.history, key=lambda p: abs(p.timestamp - simulation_timestamp))
+                if abs(closest.timestamp - simulation_timestamp) > 172800:  # 2 days
+                    _log_step("⏭️", f"Skipped (stale data): '{title}'", indent=2)
+                    return None
+
+                hist_prob = closest.probability
+                if hist_prob is not None:
+                    # Compute conviction score
+                    conv = compute_probability_conviction(ph, ev, simulation_date)
+                    conv_str = f"conviction={conv.conviction_score:.0f}" if conv else "conviction=N/A"
+                    _log_step("📊", f"'{title}' — hist prob {simulation_date}: {hist_prob:.1%} ({conv_str})", indent=2)
+                    return (ev, es, hist_prob, ph, conv)
+
+                _log_step("⏭️", f"Skipped (null probability): '{title}'", indent=2)
+                return None
+            except Exception as exc:
+                _log_step("⚠️", f"Could not fetch history for '{title}': {exc}", indent=2)
+                return None
+
+        # Use 5 workers max to respect Polymarket rate limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_fetch_one, item): item for item in needs_fetch}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is None:
+                    no_history_count += 1
+                    continue
+                ev, es, hist_prob, ph, conv = result
+                prob = hist_prob
+                if prob is None or not (min_probability <= prob <= max_probability):
+                    prob_filtered_count += 1
+                    continue
+                filtered_events.append((ev, es, hist_prob, ph, conv))
+                if len(filtered_events) >= limit:
+                    # Cancel remaining futures
+                    for f in futures:
+                        f.cancel()
+                    break
+    else:
+        # Live mode — no history fetching needed
+        for event, event_score in candidates:
+            prob = event.probability
+            if prob is None or not (min_probability <= prob <= max_probability):
+                prob_filtered_count += 1
+                continue
+            filtered_events.append((event, event_score, None, None, None))
+            if len(filtered_events) >= limit:
+                break
+
+    # Log filtering summary
+    filter_parts = []
+    if no_history_count > 0:
+        filter_parts.append(f"{no_history_count} no historical data for {simulation_date}")
+    if prob_filtered_count > 0:
+        filter_parts.append(f"{prob_filtered_count} outside probability range ({min_probability:.0%}-{max_probability:.0%})")
+    if skipped_count > 0:
+        filter_parts.append(f"{skipped_count} duplicates")
+    if filter_parts:
+        _log_step("📊", f"Filtered: {', '.join(filter_parts)}", indent=1)
+
+    if len(filtered_events) == 0:
+        _log_step("⚠️", "No events matched all filters - no discoveries this cycle", indent=1)
+    else:
+        _log_step("✅", f"Processing {len(filtered_events)} qualified events...", indent=1)
+
     # Step 4: Build portfolio context for LLM prompt
     portfolio_context = ""
     if portfolio_positions:
         portfolio_context = build_portfolio_context(portfolio_positions)
     
     # Step 5: Map each event to affected stocks using LLM
-    for idx, (event, event_score, hist_prob) in enumerate(filtered_events, 1):
+    for idx, (event, event_score, hist_prob, event_ph, event_conviction) in enumerate(filtered_events, 1):
         # Log the event being analyzed - use historical prob if available
         display_prob = hist_prob if hist_prob is not None else event.probability
         prob_str = f"{display_prob:.1%}" if display_prob else "?"
@@ -1267,6 +1360,35 @@ def discover_tickers_from_events(
         # Skip cache in backtesting mode to ensure fresh LLM analysis with date restriction
         cached_mappings = None if simulation_date else _get_cached_mappings(cache, event.id)
         
+        # Fetch outcome landscape for multi-outcome events
+        event_landscape = None
+        if event.is_multi_outcome:
+            try:
+                event_landscape = get_outcome_landscape(
+                    event,
+                    cache=cache,
+                    analysis_date=simulation_date,
+                )
+                if event_landscape:
+                    _log_step("📊", f"Multi-outcome landscape: {event_landscape.total_markets} outcomes, "
+                              f"concentration={event_landscape.concentration or 'N/A'}", indent=1)
+                    # Print full landscape table for manual verification
+                    from src.data.event_portfolio import print_landscape_table
+                    print_landscape_table(event_landscape, indent="      ")
+                    # Filter: skip DISTRIBUTED multi-outcome events with no probability flow
+                    if event_landscape.concentration == "distributed":
+                        has_flow = bool(event_landscape.fading_outcomes or event_landscape.gaining_outcomes)
+                        if not has_flow:
+                            _log_step("❌", "Distributed landscape with no flow — skipping (no directional signal)", indent=1)
+                            continue
+                    # Use landscape conviction for neg-risk events
+                    from src.data.event_portfolio import compute_landscape_conviction
+                    landscape_conv = compute_landscape_conviction(event_landscape, event, simulation_date or datetime.now().strftime("%Y-%m-%d"))
+                    if landscape_conv:
+                        event_conviction = landscape_conv
+            except Exception as e:
+                _log_step("⚠️", f"Landscape fetch failed: {e}", indent=1)
+
         if cached_mappings:
             _log_step("💾", f"Using cached stock mappings ({len(cached_mappings)} stocks)", indent=1)
             mappings = cached_mappings
@@ -1279,6 +1401,9 @@ def discover_tickers_from_events(
                 portfolio_context=portfolio_context,
                 simulation_date=simulation_date,
                 historical_probability=hist_prob,
+                price_history=event_ph,
+                conviction=event_conviction,
+                landscape=event_landscape,
             )
             if mappings and not simulation_date:
                 # Only cache in live mode, not backtesting
@@ -1322,7 +1447,7 @@ def discover_tickers_from_events(
                 continue
                 
             if mapping.confidence >= min_confidence:
-                context = _build_position_context(event, mapping, event_type)
+                context = _build_position_context(event, mapping, event_type, landscape=event_landscape)
                 # Use historical probability if available (backtesting mode)
                 prob_to_store = hist_prob if hist_prob is not None else event.probability
                 discovered.append({
@@ -1446,6 +1571,84 @@ def _cache_mappings(
     )
 
 
+def summarize_probability_history(
+    price_history: PriceHistory,
+    event: "PolymarketEvent",
+) -> str:
+    """Build a brief probability summary for the LLM prompt.
+
+    Computes current probability, 7-day trend, 30-day range, volatility
+    characterisation, and time to resolution from the price history.
+
+    Args:
+        price_history: Historical probability data
+        event: The Polymarket event (used for end_date)
+
+    Returns:
+        A 3-4 line summary string, or empty string if insufficient data.
+    """
+    if not price_history or not price_history.history:
+        return ""
+
+    points = price_history.history
+    current_prob = points[-1].probability
+
+    # 7-day trend
+    now_ts = points[-1].timestamp
+    seven_days_ago = now_ts - 7 * 86400
+    thirty_days_ago = now_ts - 30 * 86400
+
+    week_points = [p for p in points if p.timestamp >= seven_days_ago]
+    month_points = [p for p in points if p.timestamp >= thirty_days_ago]
+
+    trend_str = ""
+    if len(week_points) >= 2:
+        week_start = week_points[0].probability
+        change_7d = current_prob - week_start
+        direction = "up" if change_7d > 0 else "down"
+        trend_str = f"{change_7d:+.1%} over last 7 days, trending {direction}"
+
+    range_str = ""
+    volatility = "stable"
+    if len(month_points) >= 2:
+        month_probs = [p.probability for p in month_points]
+        lo, hi = min(month_probs), max(month_probs)
+        spread = hi - lo
+        if spread > 0.25:
+            volatility = "volatile"
+        elif spread > 0.10:
+            volatility = "moderate"
+        else:
+            volatility = "stable"
+        range_str = f"{lo:.1%} - {hi:.1%} ({volatility} volatility)"
+
+    # Time to resolution
+    resolution_str = ""
+    if event.end_date:
+        try:
+            end_dt = datetime.strptime(event.end_date[:10], "%Y-%m-%d")
+            now_dt = points[-1].datetime
+            days_left = (end_dt - now_dt).days
+            if days_left > 0:
+                resolution_str = f"{days_left} days (ends {event.end_date[:10]})"
+            else:
+                resolution_str = f"past end date ({event.end_date[:10]})"
+        except (ValueError, TypeError):
+            pass
+
+    lines = ["Probability Summary:"]
+    line1_parts = [f"Current: {current_prob:.1%}"]
+    if trend_str:
+        line1_parts.append(f"7-day change: {trend_str}")
+    lines.append("  " + " | ".join(line1_parts))
+    if range_str:
+        lines.append(f"  30-day range: {range_str}")
+    if resolution_str:
+        lines.append(f"  Time to resolution: {resolution_str}")
+
+    return "\n".join(lines)
+
+
 def _llm_map_event_to_stocks(
     event: PolymarketEvent,
     model_name: str = "gemini-2.0-flash",
@@ -1453,16 +1656,22 @@ def _llm_map_event_to_stocks(
     portfolio_context: str = "",
     simulation_date: Optional[str] = None,
     historical_probability: Optional[float] = None,
+    price_history: Optional[PriceHistory] = None,
+    conviction: Optional[ProbabilityConviction] = None,
+    landscape: Optional[OutcomeLandscape] = None,
 ) -> List[StockMapping]:
     """Use LLM to identify stocks affected by an event.
-    
+
     Phase 2 Enhancement: Now accepts portfolio_context to inject current
     portfolio positions into the prompt, helping the LLM avoid recommending
     duplicate exposure and prioritize diversification.
-    
+
     Phase 1 Backtesting Enhancement: Adds simulation_date parameter to restrict
     LLM knowledge to that date, preventing future knowledge leakage.
-    
+
+    Conviction Enhancement: Accepts conviction analysis to inject directional
+    vs bi-directional strategy guidance into the prompt.
+
     Args:
         event: The Polymarket event to analyze
         model_name: LLM model name (default: gemini-2.0-flash)
@@ -1470,6 +1679,8 @@ def _llm_map_event_to_stocks(
         portfolio_context: Optional portfolio context string for prompt injection
         simulation_date: Date string (YYYY-MM-DD) for backtesting - restricts LLM knowledge
         historical_probability: Historical probability at simulation_date (if available)
+        price_history: Optional PriceHistory for probability summary injection
+        conviction: Optional ProbabilityConviction for strategy guidance injection
     """
     
     # Build the base prompt
@@ -1507,12 +1718,28 @@ Event Status: RESOLVED (outcome: {'YES' if prob >= 0.99 else 'NO'})
     else:
         # Standard prompt - event is active (or we're backtesting)
         base_prompt = f"""{date_restriction}Analyze this Polymarket prediction market event and identify US stocks
-that would be DIRECTLY affected if this event occurs.
+that would be DIRECTLY affected by this event.
 
 Event: {event.title}
 Description: {event.description or 'No description available'}
-Current Probability: {prob_str} chance of happening
+Current Probability: {prob_str}
 """
+        # Inject probability summary if available
+        if price_history:
+            prob_summary = summarize_probability_history(price_history, event)
+            if prob_summary:
+                base_prompt += f"\n{prob_summary}\n"
+
+        # Inject conviction analysis if available
+        if conviction:
+            from src.data.event_portfolio import format_conviction_for_prompt
+            base_prompt += "\n" + format_conviction_for_prompt(conviction) + "\n"
+
+        # Inject outcome landscape for multi-outcome events
+        if landscape:
+            from src.data.event_portfolio import format_landscape_for_prompt
+            base_prompt += "\n" + format_landscape_for_prompt(landscape) + "\n"
+
         if simulation_date:
             base_prompt += f"Analysis Date: {simulation_date}\n"
 
@@ -1527,24 +1754,57 @@ not already in the portfolio for better diversification.
 """
     else:
         portfolio_section = ""
-    
+
     # Build the instruction section
     instruction_section = """
 For each affected stock, provide:
 - ticker: US stock ticker symbol
-- direction: "bullish" or "bearish" if the event happens
-- confidence: 0-100 how confident you are in this mapping
-- thesis: Brief explanation of WHY this stock is affected (1-2 sentences)
-- thesis_type: "short_term" (immediate reaction, fades after event) or "long_term" (sustained structural impact)
-- reasoning: Detailed reasoning for your analysis
+- direction: "bullish" or "bearish" — your directional thesis given the current probability landscape
+- outcome_dependent: true if this pick depends on a specific event outcome, false if the stock
+  is affected by the event's existence regardless of outcome (e.g., media stocks during elections)
+- confidence: 0-100 how confident you are
+- thesis: Brief explanation including the probability context. For outcome-dependent picks,
+  acknowledge the uncertainty (e.g., "IF Fed cuts rates (currently 55%), banks see margin compression").
+  For non-outcome-dependent picks, explain why the stock benefits regardless.
+- thesis_type: "short_term" or "long_term"
+- reasoning: Detailed reasoning
 
 IMPORTANT:
+- You decide whether to pick directional or non-directional stocks based on the probability data
+- High certainty (>65%) with short time to resolution: directional picks are reasonable
+- Uncertain outcomes (40-60%): prefer stocks affected regardless of outcome, but directional
+  picks are allowed if flagged as outcome_dependent with thesis acknowledging uncertainty
+- Include the probability trend in your thesis so downstream agents understand the event dynamics
 - Only include stocks with CLEAR, DIRECT relationships to the event
-- Do NOT include speculative or weak connections
 - Focus on companies that would see material business impact
 - If no stocks are clearly affected, return an empty list
 """
     
+    # Add multi-outcome guidance when landscape is present
+    if landscape and landscape.concentration:
+        conc = landscape.concentration
+        leading = landscape.leading_outcome or "the leading outcome"
+        if conc == "dominant":
+            instruction_section += f"""
+MULTI-OUTCOME EVENT — DOMINANT: The market has near-consensus on "{leading}".
+Focus stock picks on the specific implications of "{leading}" happening. High confidence directional picks.
+"""
+        elif conc == "concentrated":
+            instruction_section += f"""
+MULTI-OUTCOME EVENT — CONCENTRATED: "{leading}" leads but isn't certain.
+Consider stocks affected by the leading outcome, with hedges for the runner-up.
+"""
+        elif conc == "contested":
+            instruction_section += f"""
+MULTI-OUTCOME EVENT — CONTESTED: Two outcomes are competitive.
+Consider stocks affected by BOTH leading scenarios. Bi-directional picks may be appropriate.
+"""
+        else:  # distributed
+            instruction_section += """
+MULTI-OUTCOME EVENT — DISTRIBUTED: No clear consensus.
+Focus on stocks affected regardless of which outcome wins, or that benefit from the uncertainty itself.
+"""
+
     # Add backtesting reminder at the end
     if simulation_date:
         instruction_section += f"""
@@ -1603,9 +1863,16 @@ def _build_position_context(
     event: PolymarketEvent,
     mapping: StockMapping,
     event_type: EventType,
+    landscape: Optional[OutcomeLandscape] = None,
 ) -> PositionContext:
-    """Build PositionContext from event and stock mapping."""
-    
+    """Build PositionContext from event and stock mapping.
+
+    Uses create_position_context() to properly construct a PositionContext
+    with an events list (List[EventThesis]) rather than flat fields.
+    """
+    from src.data.position_context import create_position_context
+    from src.data.event_portfolio import format_landscape_for_prompt
+
     # Build probability snapshot
     prob_snapshot = ProbabilitySnapshot(
         current=event.probability or 0.0,
@@ -1614,26 +1881,35 @@ def _build_position_context(
         since_entry=None,
         at_entry=event.probability,
     )
-    
+
     # Build sequential data if applicable
     sequential_data = None
     if event_type == EventType.SEQUENTIAL:
         sequential_data = build_sequential_data(event)
-    
-    return PositionContext(
+
+    # Enrich thesis with outcome_dependent flag so portfolio manager sees it
+    thesis = mapping.thesis
+    if getattr(mapping, "outcome_dependent", False):
+        thesis = f"[OUTCOME-DEPENDENT] {thesis}"
+
+    # Thread landscape data for multi-outcome events
+    target_outcome = landscape.leading_outcome if landscape else None
+    landscape_at_entry = format_landscape_for_prompt(landscape) if landscape else None
+
+    return create_position_context(
+        ticker=mapping.ticker,
         event_id=event.id,
         event_title=event.title or "Unknown Event",
         event_type=event_type,
-        event_state=EventState.ACTIVE,
-        thesis=mapping.thesis,
+        thesis=thesis,
         thesis_type=ThesisType(mapping.thesis_type),
-        ticker=mapping.ticker,
         impact_direction=mapping.direction,
         confidence=mapping.confidence,
         probability=prob_snapshot,
         entry_date=datetime.now().strftime("%Y-%m-%d"),
-        entry_price=None,  # Set when position is opened
         sequential_data=sequential_data,
+        target_outcome=target_outcome,
+        landscape_at_entry=landscape_at_entry,
     )
 
 
