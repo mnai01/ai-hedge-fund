@@ -22,7 +22,12 @@ import hashlib
 import json
 import os
 
-from src.data.polymarket_models import PolymarketEvent, PriceHistory
+from src.data.polymarket_models import (
+    PolymarketEvent,
+    PriceHistory,
+    ProbabilityConviction,
+    OutcomeLandscape,
+)
 
 
 # =============================================================================
@@ -74,6 +79,566 @@ def has_entry_potential(
             return True, entry_date, prob
     
     return False, None, None
+
+
+def get_probability_at_date(
+    price_history: PriceHistory,
+    target_date: str,
+    max_staleness_days: int = 2,
+) -> Optional[float]:
+    """Get probability closest to target date.
+
+    Scans price_history.history for the data point closest to target_date
+    and returns its probability if within max_staleness_days, else None.
+
+    Args:
+        price_history: Historical probability data for the event
+        target_date: Date string in YYYY-MM-DD format
+        max_staleness_days: Maximum number of days between the closest
+            data point and target_date before returning None
+
+    Returns:
+        Probability (0-1) at the closest data point, or None if no data
+        exists within the staleness window.
+    """
+    if not price_history or not price_history.history:
+        return None
+
+    try:
+        target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+    target_ts = target_dt.timestamp()
+    max_staleness_seconds = max_staleness_days * 86400
+
+    closest_point = None
+    closest_delta = float("inf")
+
+    for point in price_history.history:
+        delta = abs(point.timestamp - target_ts)
+        if delta < closest_delta:
+            closest_delta = delta
+            closest_point = point
+
+    if closest_point is None or closest_delta > max_staleness_seconds:
+        return None
+
+    return closest_point.probability
+
+
+def compute_probability_conviction(
+    price_history: PriceHistory,
+    event: PolymarketEvent,
+    analysis_date: str,
+    conviction_band_tolerance: float = 0.10,
+    near_expiry_days: int = 7,
+) -> Optional[ProbabilityConviction]:
+    """Compute a conviction score measuring how firmly the market has settled on a probability level.
+
+    The conviction score replaces a simple probability-band check by considering
+    sustained level, trend, volatility, and lifecycle position.
+
+    Args:
+        price_history: Historical probability data for the event.
+        event: The Polymarket event (used for end_date / duration).
+        analysis_date: Date string (YYYY-MM-DD) – no data after this is used.
+        conviction_band_tolerance: ± tolerance around current prob for sustained-days count.
+        near_expiry_days: Days-to-resolution threshold for near-expiry flag.
+
+    Returns:
+        ProbabilityConviction or None if insufficient data.
+    """
+    import math
+
+    # 1. Get probability at the analysis date
+    prob_at_date = get_probability_at_date(price_history, analysis_date)
+    if prob_at_date is None:
+        return None
+
+    # 2. Filter history to points on or before analysis_date (no look-ahead)
+    try:
+        analysis_dt = datetime.strptime(analysis_date, "%Y-%m-%d")
+    except ValueError:
+        return None
+    analysis_ts = analysis_dt.timestamp()
+    filtered = [p for p in price_history.history if p.timestamp <= analysis_ts + 86400]
+    if len(filtered) < 2:
+        # Not enough data to compute conviction
+        return ProbabilityConviction(
+            current_probability=prob_at_date,
+            distance_from_uncertainty=abs(prob_at_date - 0.5),
+            conviction_score=0.0,
+            sustained_days=0,
+            sustained_ratio=0.0,
+            trend_direction="volatile",
+            trend_slope_7d=None,
+            volatility_30d=0.0,
+            max_drawdown=0.0,
+            event_duration_days=None,
+            days_remaining=None,
+            near_expiry=False,
+            pick_strategy="skip",
+            pick_strategy_reasoning="Fewer than 3 data points available",
+        )
+
+    # Sort ascending by timestamp
+    filtered.sort(key=lambda p: p.timestamp)
+
+    # 3. Distance from uncertainty
+    distance = abs(prob_at_date - 0.5)
+
+    # 4. Event duration & days remaining
+    event_duration_days: Optional[int] = None
+    days_remaining: Optional[int] = None
+    near_expiry = False
+
+    event_start_dt = filtered[0].datetime
+    if event.end_date:
+        try:
+            end_dt = datetime.strptime(event.end_date[:10], "%Y-%m-%d")
+            event_duration_days = max((end_dt - event_start_dt).days, 1)
+            days_remaining = (end_dt - analysis_dt).days
+            near_expiry = days_remaining is not None and days_remaining <= near_expiry_days
+        except (ValueError, TypeError):
+            pass
+
+    # 5. Sustained days – walk backwards from analysis date
+    sustained_days = 0
+    for p in reversed(filtered):
+        if abs(p.probability - prob_at_date) <= conviction_band_tolerance:
+            sustained_days += 1
+        else:
+            break
+
+    sustained_ratio = 0.0
+    if event_duration_days and event_duration_days > 0:
+        sustained_ratio = sustained_days / event_duration_days
+
+    # 6. Trend (7-day) – linear regression slope
+    last_7 = filtered[-7:] if len(filtered) >= 7 else filtered
+    trend_slope_7d: Optional[float] = None
+    trend_direction = "stable"
+
+    if len(last_7) >= 2:
+        n = len(last_7)
+        xs = list(range(n))
+        ys = [p.probability for p in last_7]
+        x_mean = sum(xs) / n
+        y_mean = sum(ys) / n
+        ss_xx = sum((x - x_mean) ** 2 for x in xs)
+        ss_xy = sum((xs[i] - x_mean) * (ys[i] - y_mean) for i in range(n))
+        if ss_xx > 0:
+            trend_slope_7d = ss_xy / ss_xx
+
+        # Count sign changes for volatility detection
+        diffs = [ys[i + 1] - ys[i] for i in range(n - 1)]
+        sign_changes = sum(
+            1 for i in range(len(diffs) - 1)
+            if (diffs[i] > 0 and diffs[i + 1] < 0) or (diffs[i] < 0 and diffs[i + 1] > 0)
+        )
+
+        if sign_changes >= 3:
+            trend_direction = "volatile"
+        elif trend_slope_7d is not None and abs(trend_slope_7d) < 0.005:
+            trend_direction = "stable"
+        elif trend_slope_7d is not None:
+            # Determine if slope pushes prob away from or toward 0.5
+            current_side = 1 if prob_at_date > 0.5 else -1
+            slope_sign = 1 if trend_slope_7d > 0 else -1
+            if current_side == slope_sign:
+                trend_direction = "rising_certainty"
+            else:
+                trend_direction = "falling_certainty"
+
+    # 7. Volatility – stdev of last 30 data points
+    last_30 = filtered[-30:] if len(filtered) >= 30 else filtered
+    probs_30 = [p.probability for p in last_30]
+    mean_30 = sum(probs_30) / len(probs_30)
+    variance_30 = sum((p - mean_30) ** 2 for p in probs_30) / len(probs_30)
+    volatility_30d = math.sqrt(variance_30)
+
+    # 8. Max drawdown – largest move back toward 0.5 after establishing distance
+    max_drawdown = 0.0
+    peak_distance = 0.0
+    for p in filtered:
+        d = abs(p.probability - 0.5)
+        if d > peak_distance:
+            peak_distance = d
+        reversal = peak_distance - d
+        if reversal > max_drawdown:
+            max_drawdown = reversal
+
+    # 9. Conviction score formula (0-100)
+    distance_score = min(distance / 0.35, 1.0) * 30
+    sustain_score = min(sustained_ratio / 0.20, 1.0) * 25
+    stability_score = max(0.0, 1.0 - volatility_30d / 0.15) * 20
+
+    # Trend bonus
+    trend_bonus = 0.0
+    if trend_direction == "rising_certainty":
+        trend_bonus = 1.0
+    elif trend_direction == "stable":
+        trend_bonus = 0.7
+    elif trend_direction == "falling_certainty":
+        trend_bonus = 0.2
+    else:  # volatile
+        trend_bonus = 0.0
+    trend_score = trend_bonus * 15
+
+    drawdown_penalty = max(0.0, 1.0 - max_drawdown / 0.20) * 10
+
+    conviction_score = distance_score + sustain_score + stability_score + trend_score + drawdown_penalty
+
+    # Near-expiry discount
+    if days_remaining is not None:
+        if days_remaining <= 3:
+            conviction_score *= 0.5
+        elif days_remaining <= near_expiry_days:
+            conviction_score *= 0.75
+
+    conviction_score = round(min(conviction_score, 100.0), 1)
+
+    # 10. Pick strategy
+    if near_expiry and days_remaining is not None and days_remaining <= 3:
+        pick_strategy = "skip"
+        pick_strategy_reasoning = f"Near expiry ({days_remaining}d remaining) — too risky to enter"
+    elif len(filtered) < 3:
+        pick_strategy = "skip"
+        pick_strategy_reasoning = "Fewer than 3 data points available"
+    elif conviction_score >= 60 and distance >= 0.15:
+        pick_strategy = "directional"
+        pick_strategy_reasoning = (
+            f"Market has sustained conviction (score={conviction_score}, "
+            f"distance={distance:.1%}, sustained {sustained_days}d). "
+            f"Favor stocks aligned with the likely outcome."
+        )
+    elif conviction_score < 30 or distance < 0.10:
+        pick_strategy = "bi_directional"
+        pick_strategy_reasoning = (
+            f"Outcome uncertain (score={conviction_score}, "
+            f"distance={distance:.1%}). "
+            f"Favor stocks affected by the event itself, regardless of outcome."
+        )
+    else:
+        pick_strategy = "bi_directional"
+        pick_strategy_reasoning = (
+            f"Moderate conviction (score={conviction_score}, "
+            f"distance={distance:.1%}). "
+            f"Default to bi-directional for safety."
+        )
+
+    return ProbabilityConviction(
+        current_probability=prob_at_date,
+        distance_from_uncertainty=distance,
+        conviction_score=conviction_score,
+        sustained_days=sustained_days,
+        sustained_ratio=round(sustained_ratio, 4),
+        trend_direction=trend_direction,
+        trend_slope_7d=round(trend_slope_7d, 6) if trend_slope_7d is not None else None,
+        volatility_30d=round(volatility_30d, 4),
+        max_drawdown=round(max_drawdown, 4),
+        event_duration_days=event_duration_days,
+        days_remaining=days_remaining,
+        near_expiry=near_expiry,
+        pick_strategy=pick_strategy,
+        pick_strategy_reasoning=pick_strategy_reasoning,
+    )
+
+
+def format_conviction_for_prompt(conviction: ProbabilityConviction) -> str:
+    """Format conviction analysis into a text block for LLM prompt injection.
+
+    Returns a multi-line string summarising the conviction analysis and
+    recommended pick strategy (directional vs bi-directional).
+    """
+    prob_pct = f"{conviction.current_probability:.1%}"
+    dist_pct = f"{conviction.distance_from_uncertainty:.1%}"
+    score = f"{conviction.conviction_score:.0f}"
+    sustained = f"{conviction.sustained_days} days"
+    if conviction.event_duration_days and conviction.event_duration_days > 0:
+        ratio_pct = f"{conviction.sustained_ratio:.0%}"
+        sustained += f" ({ratio_pct} of event)"
+
+    # Volatility label
+    if conviction.volatility_30d < 0.05:
+        vol_label = "low"
+    elif conviction.volatility_30d < 0.10:
+        vol_label = "moderate"
+    else:
+        vol_label = "high"
+    vol_str = f"{conviction.volatility_30d:.2f} ({vol_label})"
+
+    lines = [
+        "CONVICTION ANALYSIS:",
+        f"  Probability: {prob_pct} | Distance from 50%: {dist_pct}",
+        f"  Conviction: {score}/100 | Sustained: {sustained}",
+        f"  Trend: {conviction.trend_direction} | Volatility: {vol_str}",
+    ]
+    if conviction.days_remaining is not None:
+        lines.append(f"  Days to resolution: {conviction.days_remaining}")
+
+    # Strategy recommendation
+    strategy_upper = conviction.pick_strategy.upper().replace("_", "-")
+    lines.append("")
+    if conviction.pick_strategy == "directional":
+        lines.append(f"  STRATEGY: {strategy_upper} — Market has sustained conviction.")
+        lines.append("  Favor stocks aligned with the likely outcome.")
+    elif conviction.pick_strategy == "bi_directional":
+        lines.append(f"  STRATEGY: {strategy_upper} — Outcome uncertain.")
+        lines.append("  Favor stocks affected by the event itself, regardless of outcome.")
+    else:
+        lines.append(f"  STRATEGY: SKIP — {conviction.pick_strategy_reasoning}")
+
+    return "\n".join(lines)
+
+
+def format_landscape_for_prompt(landscape: OutcomeLandscape, max_outcomes: int = 10) -> str:
+    """Format an OutcomeLandscape into a text block for LLM prompt injection.
+
+    Produces a ranked table of outcomes with probabilities and 7-day changes,
+    followed by an analysis section with concentration info and signal strength.
+
+    Args:
+        landscape: The OutcomeLandscape to format
+        max_outcomes: Maximum outcomes to show in the table
+    """
+    if not landscape or not landscape.outcomes:
+        return ""
+
+    ranked = sorted(landscape.outcomes, key=lambda o: o.current_probability, reverse=True)
+    shown = ranked[:max_outcomes]
+
+    lines = [f"OUTCOME LANDSCAPE (neg-risk, {landscape.total_markets} markets):"]
+
+    for i, o in enumerate(shown, 1):
+        prob_pct = f"{o.current_probability * 100:.1f}%"
+        change_str = ""
+        if o.change_7d is not None:
+            change_str = f"  ({o.change_7d * 100:+.1f}% 7d)"
+        # Visual bar: one * per ~10%
+        bar_len = max(0, int(o.current_probability * 10 + 0.5))
+        bar = "*" * bar_len
+        lines.append(f"   {i}. {o.outcome_label:<25s} {prob_pct:>6s}{change_str} {bar}")
+
+    # Analysis section
+    lines.append("")
+    lines.append("LANDSCAPE ANALYSIS:")
+    if landscape.leading_outcome:
+        lines.append(f"  Leading: \"{landscape.leading_outcome}\" at {landscape.leading_probability * 100:.0f}%")
+    if landscape.runner_up_outcome and landscape.dominance_gap is not None:
+        lines.append(
+            f"  Runner-up: \"{landscape.runner_up_outcome}\" at "
+            f"{landscape.runner_up_probability * 100:.0f}% "
+            f"(gap: {landscape.dominance_gap * 100:.0f}%)"
+        )
+    if landscape.top_2_combined and landscape.leading_outcome and landscape.runner_up_outcome:
+        lines.append(
+            f"  Top-2 combined: {landscape.top_2_combined * 100:.0f}% "
+            f"(\"{landscape.leading_outcome}\", \"{landscape.runner_up_outcome}\")"
+        )
+
+    # Concentration interpretation
+    conc = landscape.concentration or "distributed"
+    if conc == "dominant":
+        lines.append(
+            f"  Market view: DOMINANT — \"{landscape.leading_outcome}\" leads by "
+            f"{landscape.dominance_gap * 100:.0f}% over runner-up, near-certain outcome"
+        )
+        lines.append("  Signal strength: HIGH — dominant outcome with large gap is a strong directional signal")
+    elif conc == "concentrated":
+        lines.append(
+            f"  Market view: CONCENTRATED — \"{landscape.leading_outcome}\" leads "
+            f"but outcome not certain"
+        )
+    elif conc == "contested":
+        lines.append(
+            f"  Market view: CONTESTED — top 2 outcomes hold "
+            f"{landscape.top_2_combined * 100:.0f}% but no clear winner"
+        )
+    else:
+        lines.append("  Market view: DISTRIBUTED — no clear consensus among outcomes")
+
+    # NO-signal section: outcomes being eliminated by the market
+    if landscape.fading_outcomes:
+        lines.append("")
+        lines.append("FADING OUTCOMES (market says NO — probability collapsing):")
+        for o in ranked:
+            if o.outcome_label in landscape.fading_outcomes and o.change_7d is not None:
+                lines.append(
+                    f"  - \"{o.outcome_label}\" at {o.current_probability * 100:.1f}% "
+                    f"({o.change_7d * 100:+.1f}% 7d) — market increasingly rules this out"
+                )
+        lines.append("  These NO signals are informative: eliminated outcomes free up probability")
+        lines.append("  for remaining contenders and shift the expected policy/outcome regime.")
+
+    # Probability redistribution flow
+    if landscape.redistribution_summary:
+        lines.append("")
+        lines.append(f"PROBABILITY FLOW: {landscape.redistribution_summary}")
+        lines.append("  Where probability moves FROM/TO reveals which scenario the market is pricing in.")
+
+    return "\n".join(lines)
+
+
+def print_binary_event_table(
+    price_history: PriceHistory,
+    event: PolymarketEvent,
+    analysis_date: Optional[str] = None,
+    indent: str = "      ",
+) -> None:
+    """Print YES/NO probability display for single-market events.
+
+    Shows the same visual style as the multi-outcome landscape table
+    but with just two rows: YES and NO with 7d change and visual bars.
+
+    Args:
+        price_history: The event's price history
+        event: The PolymarketEvent
+        analysis_date: Optional date string for historical lookups
+        indent: Prefix for each line
+    """
+    if not price_history or not price_history.history:
+        return
+
+    # Get current probability (at analysis_date or latest)
+    if analysis_date:
+        prob = get_probability_at_date(price_history, analysis_date)
+        if prob is None:
+            prob = price_history.latest_probability
+    else:
+        prob = price_history.latest_probability
+
+    if prob is None:
+        return
+
+    no_prob = 1.0 - prob
+
+    # Compute 7d change
+    change_7d = None
+    if len(price_history.history) >= 2:
+        from datetime import datetime as dt
+        if analysis_date:
+            try:
+                analysis_ts = int(dt.strptime(analysis_date, "%Y-%m-%d").timestamp())
+            except ValueError:
+                analysis_ts = price_history.history[-1].timestamp
+        else:
+            analysis_ts = price_history.history[-1].timestamp
+
+        ref_ts = analysis_ts - 7 * 86400
+        ref_point = min(price_history.history, key=lambda p: abs(p.timestamp - ref_ts))
+        cur_point = min(price_history.history, key=lambda p: abs(p.timestamp - analysis_ts))
+        change_7d = cur_point.probability - ref_point.probability
+
+    # Format YES row
+    yes_pct = f"{prob * 100:5.1f}%"
+    no_pct = f"{no_prob * 100:5.1f}%"
+
+    yes_change_str = ""
+    no_change_str = ""
+    yes_flow = ""
+    no_flow = ""
+    if change_7d is not None:
+        sign = "+" if change_7d >= 0 else ""
+        yes_change_str = f"  ({sign}{change_7d * 100:.1f}% 7d)"
+        no_sign = "+" if -change_7d >= 0 else ""
+        no_change_str = f"  ({no_sign}{-change_7d * 100:.1f}% 7d)"
+        # Flow labels
+        if change_7d >= 0.05:
+            yes_flow = "  <- gaining"
+            no_flow = "  <- fading"
+        elif change_7d <= -0.05:
+            yes_flow = "  <- fading"
+            no_flow = "  <- gaining"
+        elif abs(change_7d) < 0.01:
+            yes_flow = "  <- flat"
+            no_flow = "  <- flat"
+
+    # Visual bars
+    yes_bar = "█" * max(0, int(prob * 20 + 0.5))
+    no_bar = "█" * max(0, int(no_prob * 20 + 0.5))
+
+    date_label = f" @ {analysis_date}" if analysis_date else ""
+    print(f"{indent}│  YES: {yes_pct}{yes_change_str}  {yes_bar}{yes_flow}")
+    print(f"{indent}│  NO:  {no_pct}{no_change_str}  {no_bar}{no_flow}")
+
+
+def print_landscape_table(landscape: OutcomeLandscape, indent: str = "      ") -> None:
+    """Print the outcome landscape to console for manual verification against Polymarket.
+
+    Shows each outcome's YES probability, 7d change, flow label, and visual bar
+    so the user can compare rates against the Polymarket website.
+
+    Args:
+        landscape: The OutcomeLandscape to display
+        indent: Prefix for each line (default 6 spaces for nesting under event)
+    """
+    if not landscape or not landscape.outcomes:
+        return
+
+    ranked = sorted(landscape.outcomes, key=lambda o: o.current_probability, reverse=True)
+    date_label = f" @ {landscape.analysis_date}" if landscape.analysis_date else ""
+    conc = (landscape.concentration or "?").upper()
+
+    print(f"{indent}┌─ Outcome Landscape ({landscape.total_markets} markets, neg-risk){date_label}")
+    print(f"{indent}│  Tier: {conc}")
+    for i, o in enumerate(ranked, 1):
+        prob_pct = f"{o.current_probability * 100:5.1f}%"
+        change_str = ""
+        flow_label = ""
+        if o.change_7d is not None:
+            sign = "+" if o.change_7d >= 0 else ""
+            change_str = f"  ({sign}{o.change_7d * 100:.1f}% 7d)"
+            # Flow label based on 7d change magnitude
+            if o.change_7d >= 0.05:
+                flow_label = "  <- gaining"
+            elif o.change_7d <= -0.05:
+                flow_label = "  <- fading"
+            elif abs(o.change_7d) < 0.01:
+                flow_label = "  <- flat"
+        # Visual bar: one block per ~5%
+        bar_len = max(0, int(o.current_probability * 20 + 0.5))
+        bar = "█" * bar_len
+        print(f"{indent}│  {i:2d}. {o.outcome_label:<25s} {prob_pct}{change_str}  {bar}{flow_label}")
+
+    # Flow summary
+    if landscape.redistribution_summary:
+        print(f"{indent}│  Flow: {landscape.redistribution_summary}")
+
+    print(f"{indent}└─")
+
+
+def compute_landscape_conviction(
+    landscape: OutcomeLandscape,
+    event: PolymarketEvent,
+    analysis_date: str,
+) -> Optional[ProbabilityConviction]:
+    """Compute conviction for a multi-outcome event using the leading outcome.
+
+    Finds the leading outcome that has price history and delegates to
+    compute_probability_conviction(). Reuses all existing conviction logic.
+
+    Args:
+        landscape: The OutcomeLandscape with populated outcomes
+        event: The PolymarketEvent
+        analysis_date: Date string (YYYY-MM-DD)
+
+    Returns:
+        ProbabilityConviction for the leading outcome, or None if no history available.
+    """
+    if not landscape or not landscape.outcomes:
+        return None
+
+    # Find the leading outcome with price history
+    ranked = sorted(landscape.outcomes, key=lambda o: o.current_probability, reverse=True)
+    for outcome in ranked:
+        if outcome.price_history and outcome.price_history.history:
+            return compute_probability_conviction(
+                outcome.price_history, event, analysis_date
+            )
+
+    return None
 
 
 def get_entry_signal_summary(
