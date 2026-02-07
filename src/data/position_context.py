@@ -76,7 +76,17 @@ class EventThesis(BaseModel):
     # Impact assessment
     impact_direction: str = Field(..., description="'bullish' or 'bearish' if event happens")
     confidence: int = Field(..., ge=0, le=100, description="Confidence in stock mapping (0-100)")
-    
+
+    # Multi-outcome landscape context
+    target_outcome: Optional[str] = Field(
+        None,
+        description="For multi-outcome events: which outcome the thesis is based on (e.g., '4 cuts', 'Trump')"
+    )
+    landscape_at_entry: Optional[str] = Field(
+        None,
+        description="Formatted landscape snapshot when position was opened"
+    )
+
     # Probability data (snapshot, not history)
     probability: ProbabilitySnapshot = Field(..., description="Current probability snapshot")
     
@@ -302,6 +312,10 @@ class PositionContext(BaseModel):
                 lines.append(f"  - {e.event_title} ({prob_str})")
                 lines.append(f"    Thesis: {e.thesis}")
                 lines.append(f"    Direction: {e.impact_direction} (confidence: {e.confidence}%)")
+                if e.target_outcome:
+                    lines.append(f"    Target outcome: {e.target_outcome}")
+                if e.landscape_at_entry:
+                    lines.append(f"    Landscape at entry:\n{e.landscape_at_entry}")
         
         if resolved:
             lines.append(f"\nResolved Events ({len(resolved)}) - Historical Context:")
@@ -330,9 +344,11 @@ def create_position_context(
     entry_price: Optional[float] = None,
     event_state: EventState = EventState.ACTIVE,
     sequential_data: Optional[SequentialEventData] = None,
+    target_outcome: Optional[str] = None,
+    landscape_at_entry: Optional[str] = None,
 ) -> PositionContext:
     """Create a PositionContext with a single event thesis.
-    
+
     This is a convenience function for backward compatibility and
     simple use cases where a ticker has only one event thesis.
     """
@@ -348,6 +364,8 @@ def create_position_context(
         probability=probability,
         entry_date=entry_date,
         sequential_data=sequential_data,
+        target_outcome=target_outcome,
+        landscape_at_entry=landscape_at_entry,
     )
     
     return PositionContext(
@@ -623,10 +641,19 @@ def build_portfolio_context(portfolio: Dict[str, PositionContext]) -> str:
     """
     if not portfolio:
         return "Current Portfolio: Empty (no existing positions)"
-    
+
     lines = ["Current Portfolio Positions:"]
-    
+
     for ticker, context in portfolio.items():
+        # Handle both PositionContext objects and dicts
+        if isinstance(context, dict):
+            # Convert dict to PositionContext if needed
+            try:
+                context = PositionContext(**context)
+            except Exception:
+                # If conversion fails, skip this entry
+                continue
+
         active_events = context.get_active_events()
         direction = context.get_primary_direction()
         
