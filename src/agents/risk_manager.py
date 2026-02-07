@@ -18,6 +18,9 @@ def risk_management_agent(state: AgentState, agent_id: str = "risk_management_ag
     # Use centralized data provider configuration
     data_provider = get_data_provider_for_agent(state, agent_id)
     
+    # Get position context for conviction multiplier
+    position_context = data.get("position_context", {})
+
     # Initialize risk analysis for each ticker
     risk_analysis = {}
     current_prices = {}  # Store prices here to avoid redundant API calls
@@ -166,6 +169,30 @@ def risk_management_agent(state: AgentState, agent_id: str = "risk_management_ag
         
         # Combine volatility and correlation adjustments
         combined_limit_pct = vol_adjusted_limit_pct * corr_multiplier
+
+        # Apply conviction multiplier for tickers with Polymarket context
+        conviction_multiplier = 1.0
+        ctx = position_context.get(ticker)
+        if ctx:
+            try:
+                if isinstance(ctx, dict):
+                    from src.data.position_context import PositionContext as PC
+                    pc = PC(**ctx)
+                else:
+                    pc = ctx
+                events = pc.get_active_events() if hasattr(pc, 'get_active_events') else []
+                for ev in events:
+                    if ev.landscape_at_entry:
+                        if "DOMINANT" in ev.landscape_at_entry:
+                            conviction_multiplier = max(conviction_multiplier, 1.15)
+                        elif "CONCENTRATED" in ev.landscape_at_entry:
+                            conviction_multiplier = max(conviction_multiplier, 1.05)
+                        elif "DISTRIBUTED" in ev.landscape_at_entry:
+                            conviction_multiplier = min(conviction_multiplier, 0.85)
+            except Exception:
+                pass
+        combined_limit_pct *= conviction_multiplier
+
         # Convert to dollar position limit
         position_limit = total_portfolio_value * combined_limit_pct
         
@@ -194,7 +221,8 @@ def risk_management_agent(state: AgentState, agent_id: str = "risk_management_ag
                 "position_limit": float(position_limit),
                 "remaining_limit": float(remaining_position_limit),
                 "available_cash": float(portfolio.get("cash", 0)),
-                "risk_adjustment": f"Volatility x Correlation adjusted: {combined_limit_pct:.1%} (base {vol_adjusted_limit_pct:.1%})"
+                "conviction_multiplier": float(conviction_multiplier),
+                "risk_adjustment": f"Volatility x Correlation x Conviction adjusted: {combined_limit_pct:.1%} (base {vol_adjusted_limit_pct:.1%})"
             },
         }
         
