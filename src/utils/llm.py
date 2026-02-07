@@ -1,11 +1,12 @@
 """Helper functions for LLM"""
 
 import json
-from typing import Dict, get_origin, get_args
+from typing import Dict, get_origin, get_args, Optional
 from pydantic import BaseModel
 from src.llm.models import get_model, get_model_info, ModelProvider
 from src.utils.progress import progress
 from src.graph.state import AgentState
+from src.utils.cost_tracker import record_llm_call
 
 
 def call_llm(
@@ -15,6 +16,9 @@ def call_llm(
     state: AgentState | None = None,
     max_retries: int = 3,
     default_factory=None,
+    purpose: Optional[str] = None,
+    ticker: Optional[str] = None,
+    event_id: Optional[str] = None,
 ) -> BaseModel:
     """
     Makes an LLM call with retry logic, handling both JSON supported and non-JSON supported models.
@@ -26,6 +30,9 @@ def call_llm(
         state: Optional state object to extract agent-specific model configuration
         max_retries: Maximum number of retries (default: 3)
         default_factory: Optional factory function to create default response on failure
+        purpose: Optional purpose of this LLM call for cost tracking (e.g., 'stock_discovery', 'agent_analysis')
+        ticker: Optional ticker symbol for cost tracking
+        event_id: Optional Polymarket event ID for cost tracking
 
     Returns:
         An instance of the specified Pydantic model
@@ -74,6 +81,17 @@ def call_llm(
         try:
             # Call the LLM
             result = llm.invoke(prompt)
+
+            # Track cost if possible
+            _track_llm_cost(
+                result=result,
+                model_name=model_name,
+                provider=model_provider,
+                agent_name=agent_name,
+                purpose=purpose,
+                ticker=ticker,
+                event_id=event_id
+            )
 
             # For models without JSON support, we need to extract and parse the JSON manually
             if model_info and not model_info.has_json_mode():
@@ -305,20 +323,90 @@ def get_agent_model_config(state, agent_name):
     Always returns valid model_name and model_provider values.
     """
     request = state.get("metadata", {}).get("request")
-    
+
     if request and hasattr(request, 'get_agent_model_config'):
         # Get agent-specific model configuration
         model_name, model_provider = request.get_agent_model_config(agent_name)
         # Ensure we have valid values
         if model_name and model_provider:
             return model_name, model_provider.value if hasattr(model_provider, 'value') else str(model_provider)
-    
+
     # Fall back to global configuration (system defaults)
     model_name = state.get("metadata", {}).get("model_name") or "gpt-4.1"
     model_provider = state.get("metadata", {}).get("model_provider") or "OPENAI"
-    
+
     # Convert enum to string if necessary
     if hasattr(model_provider, 'value'):
         model_provider = model_provider.value
-    
+
     return model_name, model_provider
+
+
+def _track_llm_cost(
+    result: any,
+    model_name: str,
+    provider: str,
+    agent_name: Optional[str] = None,
+    purpose: Optional[str] = None,
+    ticker: Optional[str] = None,
+    event_id: Optional[str] = None
+) -> None:
+    """
+    Extract token usage from LLM response and record cost.
+
+    Args:
+        result: LLM response object
+        model_name: Model name used
+        provider: Provider name
+        agent_name: Optional agent name for tracking
+        purpose: Optional purpose for tracking
+        ticker: Optional ticker symbol
+        event_id: Optional event ID
+    """
+    try:
+        input_tokens = 0
+        output_tokens = 0
+
+        # LangChain responses typically have usage_metadata or response_metadata
+        if hasattr(result, 'usage_metadata'):
+            usage = result.usage_metadata
+            input_tokens = getattr(usage, 'input_tokens', 0) or getattr(usage, 'prompt_tokens', 0)
+            output_tokens = getattr(usage, 'output_tokens', 0) or getattr(usage, 'completion_tokens', 0)
+        elif hasattr(result, 'response_metadata'):
+            metadata = result.response_metadata
+            if 'usage' in metadata:
+                usage = metadata['usage']
+                input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+            elif 'token_usage' in metadata:
+                usage = metadata['token_usage']
+                input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+
+        # Only record if we got token counts
+        if input_tokens > 0 or output_tokens > 0:
+            # Determine purpose from agent_name if not provided
+            if not purpose and agent_name:
+                purpose = f"{agent_name}_analysis"
+            elif not purpose:
+                purpose = "unknown"
+
+            # Normalize provider string
+            if hasattr(provider, 'value'):
+                provider = provider.value
+            provider_str = str(provider).title()
+
+            record_llm_call(
+                model=model_name,
+                provider=provider_str,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                purpose=purpose,
+                agent=agent_name,
+                ticker=ticker,
+                event_id=event_id
+            )
+
+    except Exception as e:
+        # Don't let cost tracking errors break the main flow
+        print(f"Warning: Could not track LLM cost: {e}")
