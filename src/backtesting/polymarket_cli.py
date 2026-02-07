@@ -75,6 +75,7 @@ from src.tools.polymarket_api import (
     get_resolved_events,
     get_event_outcome,
     get_events_active_on_date,
+    get_outcome_landscape,
 )
 from src.tools.event_scorer import EventScorer
 from src.tools.api import get_prices, prices_to_df
@@ -82,6 +83,7 @@ from src.data.polymarket_models import (
     PolymarketEvent,
     PriceHistory,
     EventStockImpact,
+    OutcomeLandscape,
 )
 from src.data.polymarket_cache import get_polymarket_cache
 
@@ -101,12 +103,20 @@ from src.data.event_portfolio import (
     EventExposure,
     has_entry_potential,
     get_entry_signal_summary,
+    get_probability_at_date,
+    compute_probability_conviction,
+    compute_landscape_conviction,
+    format_conviction_for_prompt,
+    format_landscape_for_prompt,
+    print_landscape_table,
+    print_binary_event_table,
     check_duplicate,
     fuzzy_title_match,
     load_portfolio,
     save_portfolio,
     DeduplicationResult,
 )
+from src.data.polymarket_models import ProbabilityConviction
 
 # Import Pydantic for model definitions
 from pydantic import BaseModel, Field
@@ -115,6 +125,39 @@ from rich.console import Console
 
 # Rich console for enhanced logging
 _console = Console()
+
+
+# ==================== Phase Progress Checklist ====================
+
+PIPELINE_PHASES = [
+    ("discovery",  "Event Discovery"),
+    ("scoring",    "Algorithmic Scoring"),
+    ("conviction", "Conviction & Probability Check"),
+    ("dedup",      "Deduplication"),
+    ("relevance",  "AI Stock Relevance Check"),
+    ("backtest",   "Stock Discovery & Backtest"),
+]
+
+
+def print_progress(completed: set, current: str = "", summary: dict = None) -> None:
+    """Print the pipeline progress checklist.
+
+    Args:
+        completed: Set of completed phase keys
+        current: Key of the currently running phase (shown with spinner)
+        summary: Optional dict mapping phase key -> short result string
+    """
+    summary = summary or {}
+    print()
+    for key, label in PIPELINE_PHASES:
+        if key in completed:
+            result = f"  {summary[key]}" if key in summary else ""
+            print(f"   ✅ {label}{result}")
+        elif key == current:
+            print(f"   ⏳ {label} ...")
+        else:
+            print(f"   ⬚  {label}")
+    print()
 
 
 # ==================== Pydantic Models for LLM ====================
@@ -144,23 +187,38 @@ def discover_affected_stocks(
     max_stocks: int = 5,
     model_name: str = "gemini-3-flash-preview",
     model_provider: str = "Google",
+    conviction: Optional[ProbabilityConviction] = None,
+    landscape: Optional[OutcomeLandscape] = None,
 ) -> List[Dict[str, Any]]:
     """
     Use LLM to discover stocks affected by a Polymarket event.
-    
+
     Args:
         event: The Polymarket event
         max_stocks: Maximum number of stocks to return
         model_name: LLM model name (default: gemini-3-flash-preview)
         model_provider: LLM provider (default: Google)
-    
+        conviction: Optional conviction analysis to inject into prompt
+        landscape: Optional OutcomeLandscape for multi-outcome events
+
     Returns:
         List of dicts with ticker, direction, confidence, reasoning
     """
     try:
         from langchain_core.messages import HumanMessage
         from src.utils.llm import call_llm
-        
+        from src.data.event_portfolio import format_landscape_for_prompt
+
+        # Build conviction section if available
+        conviction_section = ""
+        if conviction:
+            conviction_section = "\n" + format_conviction_for_prompt(conviction) + "\n"
+
+        # Build landscape section if available
+        landscape_section = ""
+        if landscape:
+            landscape_section = "\n" + format_landscape_for_prompt(landscape) + "\n"
+
         prompt = f"""You are a financial analyst identifying US stocks affected by prediction market events.
 
 EVENT DETAILS:
@@ -168,7 +226,7 @@ EVENT DETAILS:
 - Description: {event.description or 'No description available'}
 - Current Probability: {event.probability:.1%} if event.probability else 'Unknown'
 - Category: {event.category or 'Unknown'}
-
+{conviction_section}{landscape_section}
 ANALYSIS FRAMEWORK - Consider BOTH direct AND indirect impacts:
 
 1. DIRECT CONNECTIONS:
@@ -199,11 +257,12 @@ ANALYSIS FRAMEWORK - Consider BOTH direct AND indirect impacts:
 REQUIREMENTS:
 - Include BOTH bullish AND bearish stocks (winners AND losers)
 - Maximum {max_stocks} stocks total
-- Focus on liquid US-listed stocks (NYSE, NASDAQ)
+- Focus on liquid US-listed INDIVIDUAL stocks (NYSE, NASDAQ)
+- NO ETFs or index funds (no SPY, QQQ, VNQ, SCHD, XLF, TAN, etc.) — only individual companies
 - Higher confidence for direct connections, lower for indirect
 
 For each stock provide:
-- ticker: Stock symbol (e.g., XOM, FSLR, DJT)
+- ticker: Individual stock symbol (e.g., XOM, FSLR, DJT) — NOT ETFs
 - direction: "bullish" if event probability INCREASING helps the stock, "bearish" if it hurts
 - confidence: 0-100 (higher for direct, lower for indirect policy implications)
 - reasoning: Brief explanation including historical context if relevant
@@ -230,15 +289,19 @@ Respond ONLY with valid JSON:
         )
         
         if result and result.stocks:
-            return [
-                {
+            from src.agents.polymarket_discovery import is_etf
+            stocks = []
+            for s in result.stocks:
+                if is_etf(s.ticker):
+                    print(f"   ⚠️ Filtering out {s.ticker} (ETF — need individual stocks)")
+                    continue
+                stocks.append({
                     "ticker": s.ticker,
                     "direction": s.direction,
                     "confidence": s.confidence,
                     "reasoning": s.reasoning,
-                }
-                for s in result.stocks
-            ]
+                })
+            return stocks
         
         return []
         
@@ -384,32 +447,43 @@ def analyze_correlation(
 def find_entry_date(
     price_history: PriceHistory,
     min_probability: float = 0.70,
+    earliest_date: Optional[str] = None,
 ) -> Optional[str]:
     """
     Find the entry date when probability first crosses threshold.
-    
+
     Both bullish and bearish stocks use the SAME entry signal (prob >= threshold)
     because we're betting ON the event happening. The direction just determines
     whether we go long (bullish) or short (bearish) on the stock.
-    
+
     Args:
         price_history: Polymarket probability history
         min_probability: Minimum probability to trigger entry (default 70%)
-    
+        earliest_date: If set, ignore data points before this date (YYYY-MM-DD).
+                       Used by historical backtests to prevent look-ahead bias.
+
     Returns:
         Entry date as string (YYYY-MM-DD) or None if threshold never crossed
     """
     if not price_history.history:
         return None
-    
+
+    earliest_dt = None
+    if earliest_date:
+        earliest_dt = datetime.strptime(earliest_date, "%Y-%m-%d")
+
     for point in price_history.history:
+        # Skip data points before the simulation date
+        if earliest_dt and point.datetime < earliest_dt:
+            continue
+
         prob = point.probability
-        
+
         # Entry signal: probability crosses threshold (same for all stocks)
         # Direction (bullish/bearish) determines long vs short position, not entry timing
         if prob >= min_probability:
             return point.datetime.strftime("%Y-%m-%d")
-    
+
     return None
 
 
@@ -419,47 +493,58 @@ def simulate_backtest(
     direction: str,
     min_probability: float = 0.70,
     hold_days: int = 0,
+    earliest_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Simulate trading based on probability threshold.
-    
+
     Both bullish and bearish stocks use the SAME entry signal (prob >= threshold)
     because we're betting ON the event happening. The direction determines:
     - Bullish: Go LONG on the stock (stock goes UP if event happens)
     - Bearish: Go SHORT on the stock (stock goes DOWN if event happens)
-    
+
     Args:
         price_history: Polymarket probability history
         stock_prices: DataFrame of stock prices (should extend beyond event end if hold_days > 0)
         direction: Expected direction ("bullish" = long, "bearish" = short)
         min_probability: Minimum probability to trigger entry (default 70%)
         hold_days: Days to hold after event resolution (default 0 = exit at event end)
-    
+        earliest_date: If set, ignore data points before this date (YYYY-MM-DD).
+                       Used by historical backtests to prevent look-ahead bias.
+
     Returns:
         Dict with backtest results
     """
     if not price_history.history or stock_prices is None or stock_prices.empty:
         return {"error": "Insufficient data"}
-    
+
+    earliest_dt = None
+    if earliest_date:
+        earliest_dt = datetime.strptime(earliest_date, "%Y-%m-%d")
+
     # Find entry point (when probability first crosses threshold)
     # Same threshold for both bullish and bearish - we're betting the event happens
     entry_date = None
     entry_prob = None
     entry_price = None
-    
+
     for point in price_history.history:
+        # Skip data points before the simulation date
+        if earliest_dt and point.datetime < earliest_dt:
+            continue
+
         prob = point.probability
-        
+
         # Entry signal: probability crosses threshold (same for all stocks)
         # Direction determines long vs short position, not entry timing
         if prob >= min_probability:
             entry_date = point.datetime
             entry_prob = prob
             break
-    
+
     if entry_date is None:
         return {
-            "error": f"Probability never crossed {min_probability:.0%} threshold",
+            "error": f"Probability never crossed {min_probability:.0%} threshold after {earliest_date or 'start'}",
             "max_probability": max(p.probability for p in price_history.history),
             "min_probability": min(p.probability for p in price_history.history),
         }
@@ -557,10 +642,13 @@ def run_backtest(
     long_hold_days: int = 7,
     short_hold_days: int = 0,
     long_only: bool = False,
+    simulation_date: Optional[str] = None,
+    conviction: Optional[ProbabilityConviction] = None,
+    landscape: Optional[OutcomeLandscape] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete backtest for a Polymarket event.
-    
+
     Args:
         event_slug: The event slug from Polymarket URL
         tickers: Optional list of tickers (if None, LLM discovers them)
@@ -573,7 +661,10 @@ def run_backtest(
         long_hold_days: Days to hold long positions after event resolution (default: 7)
         short_hold_days: Days to hold short positions after event resolution (default: 0)
         long_only: Disable short selling - filter out bearish stocks (--no-short flag)
-    
+        simulation_date: If set, constrain entry to this date or later (YYYY-MM-DD).
+                         Prevents look-ahead bias in historical backtests.
+        conviction: Optional ProbabilityConviction for strategy guidance in LLM prompt.
+
     Returns:
         Dict with complete backtest results
     """
@@ -606,15 +697,30 @@ def run_backtest(
     print(f"\n✅ Event: {event.title}")
     print(f"   Category: {event.category or 'Unknown'}")
     print(f"   Current Probability: {event.probability:.1%}" if event.probability else "   Probability: Unknown")
-    
+    if event.is_multi_outcome:
+        print(f"   Multi-outcome: Yes ({len(event.markets)} markets, neg-risk)")
+
+    # Show landscape if provided, or fetch it for multi-outcome events
+    if landscape:
+        print_landscape_table(landscape, indent="   ")
+    elif event.is_multi_outcome:
+        try:
+            landscape = get_outcome_landscape(event, cache=cache)
+            if landscape:
+                print_landscape_table(landscape, indent="   ")
+        except Exception:
+            pass
+
     results["event"] = {
         "id": event.id,
         "title": event.title,
         "category": event.category,
         "probability": event.probability,
         "description": event.description[:200] if event.description else None,
+        "is_multi_outcome": event.is_multi_outcome,
+        "num_markets": len(event.markets) if event.markets else 1,
     }
-    
+
     # Step 2: Get price history
     print(f"\nFetching probability history...")
     
@@ -665,13 +771,15 @@ def run_backtest(
         entry_date = find_entry_date(
             price_history=price_history,
             min_probability=min_probability,
+            earliest_date=simulation_date,
         )
-        
+
         if not entry_date:
-            print(f"\n⚠️ No entry signal: Probability never crossed >{min_probability:.0%} threshold")
-            results["error"] = "No entry signal - probability never crossed threshold"
+            constraint = f" after {simulation_date}" if simulation_date else ""
+            print(f"\n⚠️ No entry signal: Probability never crossed >{min_probability:.0%} threshold{constraint}")
+            results["error"] = f"No entry signal{constraint}"
             return results
-        
+
         print(f"📅 Entry signal date: {entry_date} (prob crossed {min_probability:.0%})")
         
     elif use_llm:
@@ -681,6 +789,8 @@ def run_backtest(
             max_stocks=5,
             model_name=model_name,
             model_provider=model_provider,
+            conviction=conviction,
+            landscape=landscape,
         )
         
         if stock_mappings:
@@ -696,16 +806,19 @@ def run_backtest(
                     print(f"     └─ {thesis_preview}")
             
             # Step 3b: Find entry date (same for all stocks - when prob crosses threshold)
+            # When simulation_date is set, entry can't be before that date (no look-ahead)
             entry_date = find_entry_date(
                 price_history=price_history,
                 min_probability=min_probability,
+                earliest_date=simulation_date,
             )
-            
+
             if not entry_date:
-                print(f"\n⚠️ No entry signal: Probability never crossed >{min_probability:.0%} threshold")
-                results["error"] = "No entry signal - probability never crossed threshold"
+                constraint = f" after {simulation_date}" if simulation_date else ""
+                print(f"\n⚠️ No entry signal: Probability never crossed >{min_probability:.0%} threshold{constraint}")
+                results["error"] = f"No entry signal{constraint}"
                 return results
-            
+
             print(f"\n📅 Entry signal date: {entry_date} (prob crossed {min_probability:.0%})")
             
             # Step 3c: Validate ALL stocks in one batch with news from entry date
@@ -871,6 +984,7 @@ def run_backtest(
             direction=stock_direction,
             min_probability=min_probability,
             hold_days=hold_days,
+            earliest_date=simulation_date,
         )
         
         if "error" not in backtest_result:
@@ -956,7 +1070,8 @@ def run_historical_backtest(
     categories: Optional[List[str]] = None,
     tickers: Optional[List[str]] = None,
     direction: str = "bullish",
-    min_probability: float = 0.70,
+    min_probability: float = 0.25,
+    max_probability: float = 0.75,
     verbose: bool = False,
     model_name: str = "gemini-2.0-flash",
     model_provider: str = "Google",
@@ -965,22 +1080,24 @@ def run_historical_backtest(
     min_score: float = 30.0,
     min_relevance: str = "medium",
     long_only: bool = False,
+    discovery_only: bool = False,
+    min_conviction: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Run historical backtest simulating live mode at a specific date.
-    
+
     This is the new architecture that simulates what would have happened
     if you ran the app on a historical date. It:
     1. Fetches events that were ACTIVE on start_date
     2. Scores and ranks events (algorithmic)
-    3. AI stock relevance check (filters out irrelevant events)
-    4. For each relevant event:
+    3. Conviction-based probability check (replaces simple band filter)
+    4. AI stock relevance check (filters out irrelevant events)
+    5. For each relevant event:
        a. Discovers affected stocks (LLM)
-       b. Finds entry date (prob crosses threshold)
-       c. Validates stocks with news (as of entry date)
-       d. Runs backtest
-    5. Aggregates results
-    
+       b. Validates stocks with news (as of start date)
+       c. Runs backtest
+    6. Aggregates results
+
     Args:
         start_date: Simulate running the app on this date (ISO format: "2024-01-01")
         max_events: Maximum events to analyze (default: 5)
@@ -989,7 +1106,8 @@ def run_historical_backtest(
         categories: Filter by category list
         tickers: Optional list of tickers (skip stock discovery if provided)
         direction: Direction for manual tickers
-        min_probability: Minimum probability threshold for signals
+        min_probability: Minimum probability for band filter (default: 0.25)
+        max_probability: Maximum probability for band filter (default: 0.75)
         verbose: Print detailed output
         model_name: LLM model name
         model_provider: LLM provider
@@ -998,7 +1116,8 @@ def run_historical_backtest(
         min_score: Minimum EventScorer score to analyze (default: 50.0)
         min_relevance: Minimum relevance level ("high", "medium", "low")
         long_only: Disable short selling - filter out bearish stocks (--no-short flag)
-    
+        min_conviction: Minimum conviction score to pass (default: 0 = no hard filter)
+
     Returns:
         Dict with aggregated backtest results
     """
@@ -1011,10 +1130,16 @@ def run_historical_backtest(
     print(f"   Max Events: {max_events}")
     if categories:
         print(f"   Categories: {', '.join(categories)}")
-    
+
+    # Progress tracking
+    _completed_phases: set = set()
+    _phase_summary: dict = {}
+
+    print_progress(_completed_phases, current="discovery")
+
     cache = get_polymarket_cache()
     scorer = EventScorer()
-    
+
     results = {
         "timestamp": datetime.now().isoformat(),
         "simulation_date": start_date,
@@ -1023,6 +1148,7 @@ def run_historical_backtest(
             "min_liquidity": min_liquidity,
             "max_events": max_events,
             "min_probability": min_probability,
+            "max_probability": max_probability,
             "min_score": min_score,
             "min_relevance": min_relevance,
         },
@@ -1041,7 +1167,6 @@ def run_historical_backtest(
             min_volume=min_volume,
             min_liquidity=min_liquidity,
             categories=categories,
-            limit=max_events * 5,  # Fetch more to filter
             cache=cache,
             verbose=verbose,
         )
@@ -1061,9 +1186,13 @@ def run_historical_backtest(
     results["phases"]["discovery"] = {
         "events_found": len(events),
     }
-    
+
+    _completed_phases.add("discovery")
+    _phase_summary["discovery"] = f"— {len(events)} events found"
+    print_progress(_completed_phases, current="scoring", summary=_phase_summary)
+
     # ==================== Phase 1b: Algorithmic Scoring ====================
-    print(f"\n   Scoring events...")
+    print(f"   Scoring events...")
     
     scored_events = scorer.rank_events(
         events,
@@ -1083,7 +1212,10 @@ def run_historical_backtest(
         for i, es in enumerate(all_scored.events[:10]):  # Show top 10
             event = debug_event_map.get(es.event_id)
             title = event.title[:40] if event and event.title else es.event_id[:30]
+            slug = event.slug if event and event.slug else None
+            url = f"https://polymarket.com/event/{slug}" if slug else "N/A"
             print(f"   [DEBUG]   {i+1}. Score: {es.total_score:.1f} - '{title}...'")
+            print(f"   [DEBUG]      URL: {url}")
             print(f"   [DEBUG]      Volume: {es.component_scores.get('volume', 0):.1f}, Liquidity: {es.component_scores.get('liquidity', 0):.1f}, "
                   f"Recency: {es.component_scores.get('time_horizon', 0):.1f}, Category: {es.component_scores.get('category', 0):.1f}")
             if es.total_score < min_score:
@@ -1113,22 +1245,32 @@ def run_historical_backtest(
         if es.event_id in event_map
     ]
     
-    # ==================== Phase 1c: Entry Signal Check ====================
-    # This is the KEY optimization - check if probability EVER crossed threshold
-    # BEFORE expensive LLM calls (stock discovery, relevance check)
-    print(f"\n📊 Phase 1c: Entry Signal Check")
-    print(f"   Checking if events have entry potential (prob > {min_probability:.0%})...")
-    
+    _completed_phases.add("scoring")
+    _phase_summary["scoring"] = f"— {len(scored_events.events)} above threshold"
+    print_progress(_completed_phases, current="conviction", summary=_phase_summary)
+
+    # ==================== Phase 1c: Conviction-Based Probability Check ====================
+    # Replaces simple band check with conviction scoring.
+    # High-conviction events outside the old band can pass via override.
+    # Near-expiry or data-poor events get filtered.
+    print(f"📊 Conviction-Based Probability Check")
+    print(f"   Band: [{min_probability:.0%}-{max_probability:.0%}] | Min conviction: {min_conviction:.0f}")
+
     entry_filtered_events = []
     entry_check_stats = {
         "total_checked": len(scored_event_list),
-        "has_entry_signal": 0,
-        "no_entry_signal": 0,
+        "passed": 0,
+        "passed_in_band": 0,
+        "passed_high_conviction_override": 0,
+        "filtered_outside_band": 0,
+        "filtered_skip": 0,
+        "filtered_low_conviction": 0,
+        "filtered_no_flow": 0,
         "no_price_history": 0,
     }
-    
+
     for event, event_score in scored_event_list:
-        # Fetch price history for entry signal check
+        # Fetch price history for probability check
         try:
             price_history = get_price_history_for_event(
                 event=event,
@@ -1141,45 +1283,152 @@ def run_historical_backtest(
                 print(f"   [DEBUG] Error fetching price history for {event.id}: {e}")
             entry_check_stats["no_price_history"] += 1
             continue
-        
+
         if not price_history or not price_history.history:
             entry_check_stats["no_price_history"] += 1
-            if verbose:
-                print(f"   [DEBUG] No price history for: {event.title[:40]}...")
+            event_url = f"https://polymarket.com/event/{event.slug}" if event.slug else ""
+            print(f"   ❌ Prob@{start_date}: N/A (no data near date): {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
             continue
-        
-        # Check entry potential
-        has_entry, entry_date, entry_prob = has_entry_potential(
-            price_history,
-            threshold=min_probability,
-            mode="backtest",
+
+        # Get probability at the simulation start date
+        prob_at_date = get_probability_at_date(price_history, start_date)
+
+        event_url = f"https://polymarket.com/event/{event.slug}" if event.slug else ""
+
+        if prob_at_date is None:
+            entry_check_stats["no_price_history"] += 1
+            ph_start = price_history.history[0].datetime.strftime("%Y-%m-%d")
+            ph_end = price_history.history[-1].datetime.strftime("%Y-%m-%d")
+            print(f"   ❌ Prob@{start_date}: N/A (no data near date, history: {ph_start} to {ph_end}): {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
+            continue
+
+        # Compute conviction score
+        conviction = compute_probability_conviction(price_history, event, start_date)
+
+        # Fetch outcome landscape for multi-outcome (neg-risk) events
+        landscape = None
+        if event.is_multi_outcome:
+            try:
+                landscape = get_outcome_landscape(
+                    event,
+                    top_n=7,
+                    analysis_date=start_date,
+                    cache=cache,
+                )
+                if landscape:
+                    # Use landscape-based conviction for neg-risk events
+                    landscape_conviction = compute_landscape_conviction(landscape, event, start_date)
+                    if landscape_conviction is not None:
+                        conviction = landscape_conviction
+            except Exception as e:
+                if verbose:
+                    print(f"   [DEBUG] Error fetching landscape for {event.id}: {e}")
+
+        if conviction is None or conviction.pick_strategy == "skip":
+            entry_check_stats["filtered_skip"] += 1
+            skip_reason = conviction.pick_strategy_reasoning if conviction else "no conviction data"
+            print(f"   ❌ Prob@{start_date}: {prob_at_date:.1%} [conviction=N/A, skip]: {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
+            if landscape:
+                print_landscape_table(landscape, indent="      ")
+            else:
+                print_binary_event_table(price_history, event, analysis_date=start_date, indent="      ")
+            continue
+
+        # Apply min_conviction hard filter if set
+        if min_conviction > 0 and conviction.conviction_score < min_conviction:
+            entry_check_stats["filtered_low_conviction"] += 1
+            print(f"   ❌ Prob@{start_date}: {prob_at_date:.1%} [conviction={conviction.conviction_score:.0f}, below min {min_conviction:.0f}]: {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
+            if landscape:
+                print_landscape_table(landscape, indent="      ")
+            else:
+                print_binary_event_table(price_history, event, analysis_date=start_date, indent="      ")
+            continue
+
+        # Filter DISTRIBUTED multi-outcome events with no probability flow
+        # CONTESTED or better: always accept
+        # DISTRIBUTED with flow (fading/gaining outcomes): accept — the trend is the signal
+        # DISTRIBUTED with no flow: skip — no outcome signal AND no trend
+        if landscape and landscape.concentration == "distributed":
+            has_flow = bool(landscape.fading_outcomes or landscape.gaining_outcomes)
+            if not has_flow:
+                entry_check_stats["filtered_no_flow"] += 1
+                print(f"   ❌ Prob@{start_date}: {prob_at_date:.1%} [distributed, no flow]: {event.title[:50]}")
+                if event_url:
+                    print(f"      {event_url}")
+                print_landscape_table(landscape, indent="      ")
+                continue
+
+        in_band = min_probability <= prob_at_date <= max_probability
+
+        # HIGH CONVICTION OVERRIDE: Allow events outside the band
+        # if market has sustained a clear direction
+        high_conviction = (
+            conviction.conviction_score >= 65
+            and conviction.sustained_days >= 7
+            and conviction.distance_from_uncertainty >= 0.25
+            and not conviction.near_expiry
         )
-        
-        if has_entry:
-            entry_check_stats["has_entry_signal"] += 1
-            entry_filtered_events.append((event, event_score, price_history, entry_date, entry_prob))
-            if verbose:
-                print(f"   ✅ Entry signal on {entry_date} ({entry_prob:.1%}): {event.title[:40]}...")
+
+        if in_band or high_conviction:
+            entry_check_stats["passed"] += 1
+            entry_filtered_events.append((event, event_score, price_history, start_date, prob_at_date, conviction, landscape))
+
+            override_tag = " OVERRIDE" if not in_band and high_conviction else ""
+            if not in_band and high_conviction:
+                entry_check_stats["passed_high_conviction_override"] += 1
+            else:
+                entry_check_stats["passed_in_band"] += 1
+
+            print(f"   ✅ Prob@{start_date}: {prob_at_date:.1%} [conviction={conviction.conviction_score:.0f}, sustained {conviction.sustained_days}d, {conviction.pick_strategy}]{override_tag}: {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
+            if landscape:
+                print_landscape_table(landscape, indent="      ")
+            else:
+                print_binary_event_table(price_history, event, analysis_date=start_date, indent="      ")
         else:
-            entry_check_stats["no_entry_signal"] += 1
-            if verbose:
-                max_prob = max(p.probability for p in price_history.history) if price_history.history else 0
-                print(f"   ❌ No entry signal (max prob: {max_prob:.1%}): {event.title[:40]}...")
-    
-    print(f"   Events with entry signal: {entry_check_stats['has_entry_signal']}/{entry_check_stats['total_checked']}")
-    print(f"   Filtered out (no entry): {entry_check_stats['no_entry_signal']}")
-    print(f"   Filtered out (no data): {entry_check_stats['no_price_history']}")
-    
+            entry_check_stats["filtered_outside_band"] += 1
+            print(f"   ❌ Prob@{start_date}: {prob_at_date:.1%} [conviction={conviction.conviction_score:.0f}, sustained {conviction.sustained_days}d, {conviction.pick_strategy}]: {event.title[:50]}")
+            if event_url:
+                print(f"      {event_url}")
+            if landscape:
+                print_landscape_table(landscape, indent="      ")
+            else:
+                print_binary_event_table(price_history, event, analysis_date=start_date, indent="      ")
+
+    print(f"   Passed: {entry_check_stats['passed']}/{entry_check_stats['total_checked']}")
+    print(f"     In band: {entry_check_stats['passed_in_band']}")
+    print(f"     High conviction override: {entry_check_stats['passed_high_conviction_override']}")
+    print(f"   Filtered (outside band, low conviction): {entry_check_stats['filtered_outside_band']}")
+    print(f"   Filtered (skip/near-expiry): {entry_check_stats['filtered_skip']}")
+    if entry_check_stats['filtered_low_conviction'] > 0:
+        print(f"   Filtered (below min conviction {min_conviction:.0f}): {entry_check_stats['filtered_low_conviction']}")
+    if entry_check_stats['filtered_no_flow'] > 0:
+        print(f"   Filtered (distributed, no flow): {entry_check_stats['filtered_no_flow']}")
+    print(f"   Filtered (no data): {entry_check_stats['no_price_history']}")
+
     results["phases"]["entry_signal_check"] = entry_check_stats
-    
+
     if not entry_filtered_events:
-        print(f"❌ No events have entry signal (prob never crossed {min_probability:.0%})")
-        print(f"   💡 Tip: Try lowering --min-probability threshold")
-        results["error"] = "No events with entry signal"
+        print(f"❌ No events passed conviction check on {start_date}")
+        print(f"   💡 Tip: Try widening --min-probability / --max-probability band")
+        results["error"] = "No events passed conviction check"
         return results
     
+    _completed_phases.add("conviction")
+    _phase_summary["conviction"] = f"— {entry_check_stats['passed']}/{entry_check_stats['total_checked']} passed"
+    print_progress(_completed_phases, current="dedup", summary=_phase_summary)
+
     # ==================== Phase 1d: Deduplication Check ====================
-    print(f"\n🔍 Phase 1d: Deduplication Check")
+    print(f"🔍 Deduplication Check")
     print(f"   Checking for duplicate/similar events...")
     
     # Initialize event portfolio for deduplication
@@ -1192,7 +1441,7 @@ def run_historical_backtest(
         "filtered_duplicate": 0,
     }
     
-    for event, event_score, price_history, entry_date, entry_prob in entry_filtered_events:
+    for event, event_score, price_history, entry_date, entry_prob, conviction, landscape in entry_filtered_events:
         # Check for duplicates
         dedup_result = check_duplicate(
             event=event,
@@ -1201,7 +1450,7 @@ def run_historical_backtest(
             use_llm=False,  # Don't use LLM for bulk filtering (too expensive)
             verbose=verbose,
         )
-        
+
         if dedup_result.is_duplicate:
             dedup_stats["filtered_duplicate"] += 1
             if verbose:
@@ -1209,10 +1458,10 @@ def run_historical_backtest(
                 if dedup_result.matching_event_title:
                     print(f"      └─ Matches: {dedup_result.matching_event_title[:40]}...")
             continue
-        
+
         # Not a duplicate - add to portfolio and keep
         dedup_stats["passed"] += 1
-        deduplicated_events.append((event, event_score, price_history, entry_date, entry_prob))
+        deduplicated_events.append((event, event_score, price_history, entry_date, entry_prob, conviction, landscape))
         
         # Add to portfolio for future dedup checks
         exposure = EventExposure(
@@ -1240,16 +1489,62 @@ def run_historical_backtest(
         return results
     
     # Update scored_event_list for next phase (without price history for compatibility)
-    scored_event_list = [(event, event_score) for event, event_score, _, _, _ in deduplicated_events]
-    
-    # Store price histories for later use
+    scored_event_list = [(event, event_score) for event, event_score, _, _, _, _, _ in deduplicated_events]
+
+    # Store price histories, conviction, and landscape for later use
     price_history_cache = {
-        event.id: (price_history, entry_date, entry_prob)
-        for event, _, price_history, entry_date, entry_prob in deduplicated_events
+        event.id: (price_history, entry_date, entry_prob, conviction, landscape)
+        for event, _, price_history, entry_date, entry_prob, conviction, landscape in deduplicated_events
     }
-    
+
+    _completed_phases.add("dedup")
+    _phase_summary["dedup"] = f"— {dedup_stats['passed']} unique events"
+
+    # ==================== Discovery-Only Summary ====================
+    if discovery_only:
+        print_progress(_completed_phases, summary=_phase_summary)
+        print(f"{'='*60}")
+        print(f"  Discovery Pipeline Summary (--discovery-only)")
+        print(f"{'='*60}")
+        print(f"  Simulation date:       {start_date}")
+        print(f"  Prob band:             [{min_probability:.0%}-{max_probability:.0%}]")
+        print(f"  Events from API:       {len(events)}")
+        print(f"  After scoring (>{min_score}):  {len(scored_events.events)}")
+        print(f"  In probability band:   {entry_check_stats['passed_in_band']}")
+        print(f"  After dedup:           {dedup_stats['passed']}")
+        print(f"\n  Qualified events:")
+        for i, (event, event_score, ph, edate, eprob, conv, lscape) in enumerate(deduplicated_events, 1):
+            title = (event.title or "?")[:55]
+            event_url = f"https://polymarket.com/event/{event.slug}" if event.slug else ""
+            conv_str = f"conviction={conv.conviction_score:.0f}, {conv.pick_strategy}" if conv else "conviction=N/A"
+            print(f"  {i:3d}. {title}")
+            print(f"       score={event_score.total_score:.1f}  "
+                  f"prob@{edate}={eprob:.1%}  "
+                  f"{conv_str}  "
+                  f"vol=${(event.volume or 0):,.0f}")
+            if event_url:
+                print(f"       {event_url}")
+        print(f"\n  Next steps: remove --discovery-only to run LLM relevance + stock mapping + backtest")
+        results["discovery_only"] = True
+        results["qualified_events"] = [
+            {
+                "event_id": ev.id,
+                "title": ev.title,
+                "score": es.total_score,
+                "prob_date": ed,
+                "prob_at_date": ep,
+                "conviction_score": conv.conviction_score if conv else None,
+                "pick_strategy": conv.pick_strategy if conv else None,
+                "volume": ev.volume,
+                "category": ev.category,
+            }
+            for ev, es, _, ed, ep, conv, _ in deduplicated_events
+        ]
+        return results
+
     # ==================== Phase 2: AI Stock Relevance Check ====================
-    print(f"\n🤖 Phase 2: AI Stock Relevance Check")
+    print_progress(_completed_phases, current="relevance", summary=_phase_summary)
+    print(f"🤖 AI Stock Relevance Check")
     print(f"   Checking {len(scored_event_list)} events for US stock market relevance...")
     
     # If tickers are provided, skip relevance check
@@ -1285,6 +1580,8 @@ def run_historical_backtest(
                 title_preview += "..."
             
             print(f"   {relevance_emoji} {relevance.relevance.upper()}: {title_preview}")
+            if event.slug:
+                print(f"      └─ https://polymarket.com/event/{event.slug}")
             if relevance.potential_sectors:
                 sectors_str = ", ".join(relevance.potential_sectors[:5])
                 print(f"      └─ Sectors: {sectors_str}")
@@ -1323,7 +1620,10 @@ def run_historical_backtest(
         return results
     
     # ==================== Phase 3: Stock Discovery & Backtest ====================
-    print(f"\n📈 Phase 3: Stock Discovery & Backtest")
+    _completed_phases.add("relevance")
+    _phase_summary["relevance"] = f"— {len(relevant_events)} relevant"
+    print_progress(_completed_phases, current="backtest", summary=_phase_summary)
+    print(f"📈 Stock Discovery & Backtest")
     
     all_event_results = []
     aggregate_metrics = {
@@ -1341,18 +1641,27 @@ def run_historical_backtest(
         else:
             event, event_score, relevance = event_data
         
-        # Get cached entry date info
+        # Get cached entry date info, conviction, and landscape
         cached_entry_info = price_history_cache.get(event.id)
         entry_date_cached = cached_entry_info[1] if cached_entry_info else None
         entry_prob_cached = cached_entry_info[2] if cached_entry_info else None
+        conviction_cached = cached_entry_info[3] if cached_entry_info and len(cached_entry_info) > 3 else None
+        landscape_cached = cached_entry_info[4] if cached_entry_info and len(cached_entry_info) > 4 else None
         
+        event_url = f"https://polymarket.com/event/{event.slug}" if event.slug else ""
         print(f"\n{'='*60}")
         print(f"📊 Event {i}/{len(relevant_events)}: {event.title}")
+        if event_url:
+            print(f"   {event_url}")
         print(f"   Score: {event_score.total_score:.1f}")
         if relevance:
             print(f"   Relevance: {relevance.relevance} ({relevance.confidence}% confidence)")
         if entry_date_cached:
             print(f"   Entry Signal: {entry_date_cached} ({entry_prob_cached:.1%})")
+        if conviction_cached:
+            print(f"   Conviction: {conviction_cached.conviction_score:.0f}/100 | Strategy: {conviction_cached.pick_strategy}")
+        if landscape_cached:
+            print_landscape_table(landscape_cached, indent="   ")
         print(f"{'='*60}")
         
         # Run backtest for this event
@@ -1371,6 +1680,9 @@ def run_historical_backtest(
                     long_hold_days=long_hold_days,
                     short_hold_days=short_hold_days,
                     long_only=long_only,
+                    simulation_date=start_date,
+                    conviction=conviction_cached,
+                    landscape=landscape_cached,
                 )
             else:
                 # Use LLM to discover stocks
@@ -1386,6 +1698,9 @@ def run_historical_backtest(
                     long_hold_days=long_hold_days,
                     short_hold_days=short_hold_days,
                     long_only=long_only,
+                    simulation_date=start_date,
+                    conviction=conviction_cached,
+                    landscape=landscape_cached,
                 )
             
             # Add event metadata
@@ -1429,7 +1744,12 @@ def run_historical_backtest(
             })
     
     results["event_results"] = all_event_results
-    
+
+    _completed_phases.add("backtest")
+    total_trades = aggregate_metrics["winning_trades"] + aggregate_metrics["losing_trades"]
+    _phase_summary["backtest"] = f"— {aggregate_metrics['total_stocks']} stocks, {total_trades} trades"
+    print_progress(_completed_phases, summary=_phase_summary)
+
     # ==================== Summary ====================
     total_trades = aggregate_metrics["winning_trades"] + aggregate_metrics["losing_trades"]
     if total_trades > 0:
@@ -1461,8 +1781,13 @@ def run_historical_backtest(
     print(f"\n📊 Filtering Pipeline Stats:")
     if "entry_signal_check" in results["phases"]:
         esc = results["phases"]["entry_signal_check"]
-        print(f"   Entry Signal Check: {esc['has_entry_signal']}/{esc['total_checked']} passed")
-        print(f"      └─ Saved ~{esc['no_entry_signal']} LLM calls (no entry signal)")
+        passed = esc.get('passed', esc.get('in_band', 0))
+        overrides = esc.get('passed_high_conviction_override', 0)
+        filtered_out = esc.get('filtered_outside_band', 0) + esc.get('filtered_skip', 0) + esc.get('filtered_low_conviction', 0)
+        print(f"   Conviction Check: {passed}/{esc['total_checked']} passed")
+        if overrides > 0:
+            print(f"      └─ {overrides} high-conviction overrides (outside band but sustained)")
+        print(f"      └─ Saved ~{filtered_out} LLM calls (filtered)")
     if "deduplication" in results["phases"]:
         dd = results["phases"]["deduplication"]
         print(f"   Deduplication: {dd['passed']}/{dd['total_checked']} unique")
@@ -1471,8 +1796,12 @@ def run_historical_backtest(
     # Calculate total LLM calls saved
     total_filtered = 0
     if "entry_signal_check" in results["phases"]:
-        total_filtered += results["phases"]["entry_signal_check"]["no_entry_signal"]
-        total_filtered += results["phases"]["entry_signal_check"]["no_price_history"]
+        esc2 = results["phases"]["entry_signal_check"]
+        total_filtered += esc2.get("filtered_outside_band", esc2.get("outside_band", 0))
+        total_filtered += esc2.get("filtered_skip", 0)
+        total_filtered += esc2.get("filtered_low_conviction", 0)
+        total_filtered += esc2.get("filtered_no_flow", 0)
+        total_filtered += esc2.get("no_price_history", 0)
     if "deduplication" in results["phases"]:
         total_filtered += results["phases"]["deduplication"]["filtered_duplicate"]
     
@@ -1568,8 +1897,15 @@ Examples:
     parser.add_argument(
         "--min-probability",
         type=float,
-        default=0.70,
-        help="Minimum probability threshold for entry signals (default: 0.70)"
+        default=0.25,
+        help="Minimum probability for band filter (default: 0.25). Events below this are too uncertain."
+    )
+
+    parser.add_argument(
+        "--max-probability",
+        type=float,
+        default=0.75,
+        help="Maximum probability for band filter (default: 0.75). Events above this are already priced in."
     )
     
     parser.add_argument(
@@ -1619,6 +1955,22 @@ Examples:
     )
     
     parser.add_argument(
+        "--min-conviction",
+        type=float,
+        default=0.0,
+        help="Minimum conviction score to pass (default: 0 = computed but not used as hard filter). "
+             "Events below this conviction score are filtered out."
+    )
+
+    parser.add_argument(
+        "--discovery-only",
+        action="store_true",
+        default=False,
+        help="Run discovery pipeline only (fetch, score, entry signal, dedup) — "
+             "skip LLM relevance check, stock discovery, and backtest simulation"
+    )
+
+    parser.add_argument(
         "--output",
         help="Save results to JSON file"
     )
@@ -1644,6 +1996,7 @@ Examples:
             tickers=args.tickers,
             direction=args.direction,
             min_probability=args.min_probability,
+            max_probability=args.max_probability,
             verbose=args.verbose,
             model_name=args.model,
             model_provider=args.provider,
@@ -1652,6 +2005,8 @@ Examples:
             min_score=args.min_score,
             min_relevance=args.min_relevance,
             long_only=args.no_short,
+            discovery_only=args.discovery_only,
+            min_conviction=args.min_conviction,
         )
     else:
         # Run single event backtest by slug
