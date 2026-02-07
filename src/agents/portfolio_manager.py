@@ -50,6 +50,7 @@ def portfolio_management_agent(state: AgentState, agent_id: str = "portfolio_man
     portfolio = state["data"]["portfolio"]
     analyst_signals = state["data"]["analyst_signals"]
     tickers = state["data"]["tickers"]
+    position_context = state["data"].get("position_context", {})
 
     position_limits = {}
     current_prices = {}
@@ -101,6 +102,7 @@ def portfolio_management_agent(state: AgentState, agent_id: str = "portfolio_man
         agent_id=agent_id,
         state=state,
         long_only=long_only,
+        position_context=position_context,
     )
     message = HumanMessage(
         content=json.dumps({ticker: decision.model_dump() for ticker, decision in result.decisions.items()}),
@@ -275,9 +277,10 @@ def generate_trading_decision(
         agent_id: str,
         state: AgentState,
         long_only: bool = False,
+        position_context: dict = None,
 ) -> PortfolioManagerOutput:
     """Get decisions from the LLM with deterministic constraints and a minimal prompt.
-    
+
     Args:
         tickers: List of ticker symbols
         signals_by_ticker: Analyst signals per ticker
@@ -287,6 +290,7 @@ def generate_trading_decision(
         agent_id: Agent identifier for logging
         state: Agent state
         long_only: If True, disable short selling (--no-short flag)
+        position_context: Optional dict of ticker -> Polymarket event context
     """
 
     # Deterministic constraints
@@ -312,33 +316,76 @@ def generate_trading_decision(
     compact_signals = _compact_signals({t: signals_by_ticker.get(t, {}) for t in tickers_for_llm})
     compact_allowed = {t: allowed_actions_full[t] for t in tickers_for_llm}
 
+    # Build event context string for tickers that have Polymarket context
+    event_context_str = ""
+    if position_context:
+        event_context_parts = []
+        for ticker in tickers_for_llm:
+            ctx = position_context.get(ticker)
+            if ctx:
+                try:
+                    if isinstance(ctx, dict):
+                        from src.data.position_context import PositionContext as PC
+                        pc = PC(**ctx)
+                        summary = pc.get_context_summary()
+                    else:
+                        summary = ctx.get_context_summary()
+                    if summary:
+                        event_context_parts.append(summary)
+                except Exception:
+                    pass
+        if event_context_parts:
+            event_context_str = "\n".join(event_context_parts)
+
     # Minimal prompt template
+    system_msg = (
+        "You are a portfolio manager.\n"
+        "Inputs per ticker: analyst signals and allowed actions with max qty (already validated).\n"
+    )
+    if long_only:
+        system_msg += (
+            "LONG-ONLY MODE: Short selling is disabled. Your actions are buy, sell, and hold.\n"
+            "Tactical selling is encouraged: if you hold a position and expect a near-term pullback, "
+            "sell now to lock in gains, then rebuy at a lower price on the next cycle. "
+            "Selling is not just for exiting — it is your tool for capturing downside moves.\n"
+        )
+    if event_context_str:
+        system_msg += (
+            "POLYMARKET EVENT CONTEXT:\n"
+            "Event context includes the thesis (why this stock was picked) and outcome landscape.\n"
+            "- DOMINANT outcome (one outcome >60%, large gap): High confidence directional signal. Commit to the thesis.\n"
+            "- CONCENTRATED (leader >50%): Thesis likely valid but not certain. Normal position sizing.\n"
+            "- CONTESTED (top-2 >70%, leader <50%): Two-horse race. Consider reducing position or hedging.\n"
+            "- DISTRIBUTED (no consensus): Thesis uncertain. Smaller position or hold.\n"
+            "If the target outcome probability has DROPPED significantly since entry, consider selling.\n"
+            "If target outcome has RISEN since entry, thesis is strengthening — consider adding.\n"
+        )
+    system_msg += (
+        "Pick one allowed action per ticker and a quantity ≤ the max. "
+        "Keep reasoning very concise (max 100 chars). No cash or margin math. Return JSON only."
+    )
+
+    human_msg = "{event_context}" \
+        "Signals:\n{signals}\n\n" \
+        "Allowed:\n{allowed}\n\n" \
+        "Format:\n" \
+        "{{\n" \
+        '  "decisions": {{\n' \
+        '    "TICKER": {{"action":"...","quantity":int,"confidence":int,"reasoning":"..."}}\n' \
+        "  }}\n" \
+        "}}"
+
     template = ChatPromptTemplate.from_messages(
         [
-            (
-                "system",
-                "You are a portfolio manager.\n"
-                "Inputs per ticker: analyst signals and allowed actions with max qty (already validated).\n"
-                "Pick one allowed action per ticker and a quantity ≤ the max. "
-                "Keep reasoning very concise (max 100 chars). No cash or margin math. Return JSON only."
-            ),
-            (
-                "human",
-                "Signals:\n{signals}\n\n"
-                "Allowed:\n{allowed}\n\n"
-                "Format:\n"
-                "{{\n"
-                '  "decisions": {{\n'
-                '    "TICKER": {{"action":"...","quantity":int,"confidence":int,"reasoning":"..."}}\n'
-                "  }}\n"
-                "}}"
-            ),
+            ("system", system_msg),
+            ("human", human_msg),
         ]
     )
 
     prompt_data = {
         "signals": json.dumps(compact_signals, separators=(",", ":"), ensure_ascii=False),
         "allowed": json.dumps(compact_allowed, separators=(",", ":"), ensure_ascii=False),
+        "event_context": f"Event Context:\n{event_context_str}\n\n" if event_context_str else "",
     }
     prompt = template.invoke(prompt_data)
 
