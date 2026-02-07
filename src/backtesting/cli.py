@@ -147,51 +147,36 @@ Examples:
     # Validate CLI arguments before proceeding
     validation_errors = []
     
-    # Helper function to adjust date to next business day
-    def adjust_to_business_day(dt: datetime, forward: bool = True) -> datetime:
-        """Adjust a date to the nearest business day.
-        
-        Args:
-            dt: The date to adjust
-            forward: If True, move to next business day; if False, move to previous
-        """
-        # Saturday = 5, Sunday = 6
-        weekday = dt.weekday()
-        if weekday == 5:  # Saturday
-            return dt + relativedelta(days=2 if forward else -1)
-        elif weekday == 6:  # Sunday
-            return dt + relativedelta(days=1 if forward else -2)
-        return dt
-    
     # 1. Validate date format and logic
     try:
         start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
     except ValueError:
         validation_errors.append(f"Invalid start-date format: '{args.start_date}'. Use YYYY-MM-DD.")
         start_dt = None
-    
+
     try:
         end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
     except ValueError:
         validation_errors.append(f"Invalid end-date format: '{args.end_date}'. Use YYYY-MM-DD.")
         end_dt = None
-    
-    # Adjust weekend dates to business days
+
+    # Adjust non-trading dates (weekends + NYSE holidays) to nearest trading day
+    from src.utils.trading_calendar import adjust_to_trading_day
     if start_dt:
-        adjusted_start = adjust_to_business_day(start_dt, forward=True)
-        if adjusted_start != start_dt:
-            print(f"{Fore.YELLOW}Note: start-date {args.start_date} is a weekend. "
-                  f"Adjusted to {adjusted_start.strftime('%Y-%m-%d')} (next business day).{Style.RESET_ALL}")
-            args.start_date = adjusted_start.strftime("%Y-%m-%d")
-            start_dt = adjusted_start
-    
+        adjusted_start_str = adjust_to_trading_day(args.start_date, forward=True)
+        if adjusted_start_str != args.start_date:
+            print(f"{Fore.YELLOW}Note: start-date {args.start_date} is not a trading day. "
+                  f"Adjusted to {adjusted_start_str} (next trading day).{Style.RESET_ALL}")
+            args.start_date = adjusted_start_str
+            start_dt = datetime.strptime(adjusted_start_str, "%Y-%m-%d")
+
     if end_dt:
-        adjusted_end = adjust_to_business_day(end_dt, forward=False)
-        if adjusted_end != end_dt:
-            print(f"{Fore.YELLOW}Note: end-date {args.end_date} is a weekend. "
-                  f"Adjusted to {adjusted_end.strftime('%Y-%m-%d')} (previous business day).{Style.RESET_ALL}")
-            args.end_date = adjusted_end.strftime("%Y-%m-%d")
-            end_dt = adjusted_end
+        adjusted_end_str = adjust_to_trading_day(args.end_date, forward=False)
+        if adjusted_end_str != args.end_date:
+            print(f"{Fore.YELLOW}Note: end-date {args.end_date} is not a trading day. "
+                  f"Adjusted to {adjusted_end_str} (previous trading day).{Style.RESET_ALL}")
+            args.end_date = adjusted_end_str
+            end_dt = datetime.strptime(adjusted_end_str, "%Y-%m-%d")
     
     if start_dt and end_dt and start_dt > end_dt:
         validation_errors.append(f"start-date ({args.start_date}) must be before or equal to end-date ({args.end_date}).")
@@ -415,8 +400,8 @@ Examples:
         selected_analysts=selected_analysts,
         autonomous_mode=is_autonomous,
         max_positions=args.max_positions,
-        min_probability=0.60,
-        max_probability=0.85,
+        min_probability=0.25,  # Loose band to filter noise, not signal
+        max_probability=0.75,  # Lowered from 0.85 to avoid near-certainties
         min_confidence=70,
         min_score=40.0,
         validate_with_news=True,
@@ -436,11 +421,11 @@ Examples:
         print(f"   Max positions: {args.max_positions}")
         print(f"{'='*60}")
         print(f"\n{Fore.CYAN}[BACKTEST] Starting backtest engine...{Style.RESET_ALL}\n")
-        
-        # Start with placeholder ticker for autonomous mode
-        # The engine will discover real tickers on the first day
-        # We need at least one ticker to initialize the portfolio
-        initial_tickers = ["SPY"]  # Placeholder, will be replaced by discoveries
+
+        # Start with empty ticker list in autonomous mode
+        # The engine will discover tickers from Polymarket events
+        # Days with no discoveries will be skipped (no forced trading on SPY)
+        initial_tickers = []  # Empty - discoveries will populate this
     else:
         initial_tickers = tickers
 

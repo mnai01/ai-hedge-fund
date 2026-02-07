@@ -237,10 +237,13 @@ class BacktestEngine:
         Returns:
             PerformanceMetrics with sharpe, sortino, max drawdown, etc.
         """
+        from src.utils.trading_calendar import get_trading_days, get_previous_trading_day
+
         # Prefetch data for initial tickers
         self._prefetch_data(self._tickers)
 
-        dates = pd.date_range(self._start_date, self._end_date, freq="B")
+        trading_day_strs = get_trading_days(self._start_date, self._end_date)
+        dates = [pd.Timestamp(d) for d in trading_day_strs]
         if len(dates) > 0:
             self._portfolio_values = [
                 {"Date": dates[0], "Portfolio Value": self._initial_capital}
@@ -253,13 +256,10 @@ class BacktestEngine:
 
         for current_date in dates:
             current_date_str = current_date.strftime("%Y-%m-%d")
-            
-            # Calculate previous business day (not just previous calendar day)
-            # This handles weekends: if current_date is Monday, previous business day is Friday
-            prev_date = current_date - relativedelta(days=1)
-            # Skip back over weekends (Saturday=5, Sunday=6)
-            while prev_date.weekday() >= 5:
-                prev_date = prev_date - relativedelta(days=1)
+
+            # Calculate previous trading day using NYSE calendar
+            # Handles weekends AND holidays (Good Friday, MLK Day, etc.)
+            prev_date = pd.Timestamp(get_previous_trading_day(current_date_str))
             
             lookback_start = (current_date - relativedelta(months=1)).strftime("%Y-%m-%d")
             if lookback_start == current_date_str:

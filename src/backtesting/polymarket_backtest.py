@@ -171,9 +171,11 @@ class PolymarketBacktester:
         # Generate daily signals and simulate trading
         current_date = self.config.start_date
         
+        from src.utils.trading_calendar import is_trading_day
+
         while current_date <= self.config.end_date:
-            # Skip weekends
-            if current_date.weekday() >= 5:
+            # Skip non-trading days (weekends + NYSE holidays)
+            if not is_trading_day(current_date.strftime("%Y-%m-%d")):
                 current_date += timedelta(days=1)
                 continue
             
