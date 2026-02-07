@@ -383,6 +383,8 @@ def get_market_cap(
 
 def prices_to_df(prices: list[Price]) -> pd.DataFrame:
     """Convert prices to a DataFrame."""
+    if not prices:
+        return pd.DataFrame(columns=["open", "close", "high", "low", "volume"])
     df = pd.DataFrame([p.model_dump() for p in prices])
     df["Date"] = pd.to_datetime(df["time"])
     df.set_index("Date", inplace=True)
