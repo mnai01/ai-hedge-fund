@@ -116,7 +116,11 @@ class PolymarketEvent(BaseModel):
     new: Optional[bool] = None
     featured: Optional[bool] = None
     restricted: Optional[bool] = None
-    
+    closed_time: Optional[str] = Field(None, alias="closedTime")
+    creation_date: Optional[str] = Field(None, alias="creationDate")
+    neg_risk: Optional[bool] = Field(None, alias="negRisk")
+    enable_order_book: Optional[bool] = Field(None, alias="enableOrderBook")
+
     # Tags for categorization
     tags: Optional[List[Dict[str, Any]]] = None
     
@@ -136,7 +140,26 @@ class PolymarketEvent(BaseModel):
         if self.markets and len(self.markets) > 0:
             return self.markets[0]
         return None
-    
+
+    @property
+    def is_multi_outcome(self) -> bool:
+        """True if this is a neg-risk event with multiple markets."""
+        return bool(self.neg_risk) and bool(self.markets) and len(self.markets) > 1
+
+    @property
+    def top_markets_by_volume(self) -> List["PolymarketMarket"]:
+        """Markets sorted by volume descending."""
+        if not self.markets:
+            return []
+        return sorted(self.markets, key=lambda m: m.volume or 0, reverse=True)
+
+    @property
+    def top_markets_by_probability(self) -> List["PolymarketMarket"]:
+        """Markets sorted by YES probability descending (most likely outcomes first)."""
+        if not self.markets:
+            return []
+        return sorted(self.markets, key=lambda m: m.primary_probability or 0, reverse=True)
+
     @property
     def category(self) -> Optional[str]:
         """Extract category from tags if available.
@@ -411,9 +434,135 @@ class PriceHistory(BaseModel):
         return current.probability - past.probability
 
 
+class ProbabilityConviction(BaseModel):
+    """How firmly the market has settled on a probability level."""
+
+    current_probability: float          # Prob at analysis date (0-1)
+    distance_from_uncertainty: float    # abs(prob - 0.5), range 0-0.5
+    conviction_score: float             # Composite 0-100
+
+    # Sustain
+    sustained_days: int                 # Consecutive days within ±10% of current level
+    sustained_ratio: float              # sustained_days / event_duration (0-1)
+
+    # Trend
+    trend_direction: Literal["rising_certainty", "falling_certainty", "stable", "volatile"]
+    trend_slope_7d: Optional[float] = None  # Linear regression slope over 7 days
+
+    # Volatility
+    volatility_30d: float               # Stdev of daily probability over 30 days
+    max_drawdown: float                 # Largest reversal toward 50%
+
+    # Lifecycle
+    event_duration_days: Optional[int] = None
+    days_remaining: Optional[int] = None
+    near_expiry: bool = False           # Within 7 days of end date
+
+    # Strategy recommendation
+    pick_strategy: Literal["directional", "bi_directional", "skip"]
+    pick_strategy_reasoning: str
+
+
+class OutcomeSnapshot(BaseModel):
+    """A single outcome within a multi-outcome event."""
+    market_id: str
+    question: str                          # "Will there be 3 rate cuts?"
+    outcome_label: str                     # Short: "3 cuts", "Trump"
+    current_probability: float             # Prob at analysis date (0-1)
+    change_7d: Optional[float] = None      # 7-day probability change
+    volume: Optional[float] = None         # Market volume
+    token_id: Optional[str] = None         # CLOB token ID
+    price_history: Optional[PriceHistory] = None
+
+
+class OutcomeLandscape(BaseModel):
+    """Complete probability landscape for a multi-outcome (neg-risk) event."""
+    event_id: str
+    event_title: str
+    is_neg_risk: bool = True
+    total_markets: int
+    fetched_markets: int
+    outcomes: List[OutcomeSnapshot] = Field(default_factory=list)
+
+    # Derived (call compute_derived() after populating outcomes)
+    leading_outcome: Optional[str] = None
+    leading_probability: Optional[float] = None
+    runner_up_outcome: Optional[str] = None
+    runner_up_probability: Optional[float] = None
+    dominance_gap: Optional[float] = None     # Leading minus runner-up probability
+    top_2_combined: Optional[float] = None
+    top_3_combined: Optional[float] = None
+    concentration: Optional[str] = None       # "dominant"|"concentrated"|"contested"|"distributed"
+    analysis_date: Optional[str] = None
+
+    # NO-signal tracking: outcomes with large 7d probability moves
+    fading_outcomes: List[str] = Field(default_factory=list)    # Labels losing probability (NO signals)
+    gaining_outcomes: List[str] = Field(default_factory=list)   # Labels gaining probability
+    redistribution_summary: Optional[str] = None  # Human-readable "X -8% → Y +5%, Z +3%"
+
+    def compute_derived(self) -> None:
+        """Compute leading outcome, dominance gap, combined probs, concentration, and flow signals."""
+        if not self.outcomes:
+            return
+        ranked = sorted(self.outcomes, key=lambda o: o.current_probability, reverse=True)
+        self.leading_outcome = ranked[0].outcome_label
+        self.leading_probability = ranked[0].current_probability
+        if len(ranked) >= 2:
+            self.runner_up_outcome = ranked[1].outcome_label
+            self.runner_up_probability = ranked[1].current_probability
+            self.dominance_gap = ranked[0].current_probability - ranked[1].current_probability
+            self.top_2_combined = ranked[0].current_probability + ranked[1].current_probability
+        if len(ranked) >= 3:
+            self.top_3_combined = sum(o.current_probability for o in ranked[:3])
+        # Concentration levels (4 tiers):
+        # - dominant:      Leader >= 60% AND gap >= 25%
+        # - concentrated:  Leader >= 50% but not dominant
+        # - contested:     Top-2 combined >= 70% but leader < 50%
+        # - distributed:   No clear consensus
+        if (self.leading_probability >= 0.60
+                and self.dominance_gap is not None
+                and self.dominance_gap >= 0.25):
+            self.concentration = "dominant"
+        elif self.leading_probability >= 0.50:
+            self.concentration = "concentrated"
+        elif self.top_2_combined and self.top_2_combined >= 0.70:
+            self.concentration = "contested"
+        else:
+            self.concentration = "distributed"
+
+        # NO-signal tracking: detect fading and gaining outcomes from 7d changes
+        fading = []
+        gaining = []
+        for o in self.outcomes:
+            if o.change_7d is not None:
+                if o.change_7d <= -0.05:   # Lost >= 5% in 7 days
+                    fading.append(o)
+                elif o.change_7d >= 0.05:  # Gained >= 5% in 7 days
+                    gaining.append(o)
+
+        # Sort by magnitude of change
+        fading.sort(key=lambda o: o.change_7d)           # Most negative first
+        gaining.sort(key=lambda o: o.change_7d, reverse=True)  # Most positive first
+
+        self.fading_outcomes = [o.outcome_label for o in fading]
+        self.gaining_outcomes = [o.outcome_label for o in gaining]
+
+        # Build redistribution summary: "Biden -8% → Trump +5%, DeSantis +3%"
+        if fading and gaining:
+            from_parts = [f"{o.outcome_label} {o.change_7d * 100:+.0f}%" for o in fading[:3]]
+            to_parts = [f"{o.outcome_label} {o.change_7d * 100:+.0f}%" for o in gaining[:3]]
+            self.redistribution_summary = f"{', '.join(from_parts)} → {', '.join(to_parts)}"
+        elif fading:
+            from_parts = [f"{o.outcome_label} {o.change_7d * 100:+.0f}%" for o in fading[:3]]
+            self.redistribution_summary = f"Fading: {', '.join(from_parts)}"
+        elif gaining:
+            to_parts = [f"{o.outcome_label} {o.change_7d * 100:+.0f}%" for o in gaining[:3]]
+            self.redistribution_summary = f"Gaining: {', '.join(to_parts)}"
+
+
 class PriceHistoryResponse(BaseModel):
     """Response wrapper for CLOB API prices-history endpoint."""
-    
+
     history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
